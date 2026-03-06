@@ -1039,18 +1039,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             238, 102, 210, 28, hwnd, (HMENU)IDC_BTN_PIN, hi, nullptr);
 
-        // -- Row 2: Start | Cookie Manager | Stop --
+        // -- Row 2: Start | Stop --
         hBtnStart = CreateWindowW(L"BUTTON", L"\u958B\u59CB",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            12, 142, 108, 34, hwnd, (HMENU)IDC_BTN_START, hi, nullptr);
-
-        CreateWindowW(L"BUTTON", L"Roblox Cookie \u7BA1\u7406\u5668",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            130, 142, 200, 34, hwnd, (HMENU)IDC_BTN_COOKIE, hi, nullptr);
+            12, 142, 210, 34, hwnd, (HMENU)IDC_BTN_START, hi, nullptr);
 
         hBtnStop = CreateWindowW(L"BUTTON", L"\u505C\u6B62",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            340, 142, 108, 34, hwnd, (HMENU)IDC_BTN_STOP, hi, nullptr);
+            238, 142, 210, 34, hwnd, (HMENU)IDC_BTN_STOP, hi, nullptr);
 
         // -- Status label --
         hLblStatus = CreateWindowW(L"STATIC",
@@ -1238,9 +1234,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 g_pinned ? L"\u2736 \u5DF2\u91D8\u9078" : L"\u2736 \u91D8\u9078");
             break;
 
-        case IDC_BTN_COOKIE:
-            OpenCookieWindow();
-            break;
 
         case IDC_BTN_HELP:
             MessageBoxW(hwnd,
