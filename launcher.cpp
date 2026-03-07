@@ -5,6 +5,7 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "advapi32.lib")
 #define UNICODE
 #define _UNICODE
 #define _WIN32_WINNT 0x0600
@@ -18,7 +19,7 @@
 // ======================================================================
 // Constants
 // ======================================================================
-#define APP_TITLE   L"1yn AutoClick - \x91D1\x9470\x555F\x52D5\x5668"
+#define APP_TITLE   L"1yn AutoClick - \x91D1\x9470\x555F\x52D5\x5668 (1ynkeycheck)"
 #define TARGET_EXE  L"yy_clicker.exe"
 
 // Railway Bot server for key verification
@@ -62,17 +63,18 @@ static void GetExeDir(wchar_t* buf, int bufLen) {
 }
 
 // ======================================================================
-// Get HWID (computer name + volume serial number, no Registry needed)
+// Get HWID (computer name + user name, matches yy_clicker.cpp format)
 // ======================================================================
 static void GetHWID(wchar_t* hwid, int hwidLen) {
     wchar_t compName[MAX_COMPUTERNAME_LENGTH + 1] = {};
     DWORD compSize = MAX_COMPUTERNAME_LENGTH + 1;
     GetComputerNameW(compName, &compSize);
 
-    DWORD volSerial = 0;
-    GetVolumeInformationW(L"C:\\", NULL, 0, &volSerial, NULL, NULL, NULL, 0);
+    wchar_t userName[256] = {};
+    DWORD userSize = 256;
+    GetUserNameW(userName, &userSize);
 
-    wsprintfW(hwid, L"%s-%08X", compName, volSerial);
+    wsprintfW(hwid, L"%s_%s", compName, userName);
 }
 
 // ======================================================================
