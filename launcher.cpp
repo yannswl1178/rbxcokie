@@ -54,7 +54,7 @@ static const wchar_t* KEY_SERVER_HOST = L"web-production-a8756.up.railway.app";
 static const wchar_t* KEY_VERIFY_PATH = L"/api/verify-key";
 
 // Google Apps Script URL（HWID 同步用）
-static const char* GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzNs8M7i2LTUrD38tvM5SvvAtWOltxq8AuvmFlpa6MAQN3YxkXfpRFNNSsoyryEH1PRIQ/exec";
+static const char* GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxFID2dQMjC5xK228bkORU9ZYXICwtfdJ7gFSuOA3Xe69bULbpN9uKdmSLT_9xECW6usw/exec";
 
 // HWID 加密 salt（必須與 bot.js 和 yy_clicker.cpp 一致）
 static const char HWID_SALT[] = "1yn-autoclick-hwid-salt-v2-s3cur3K3y!";
@@ -384,7 +384,7 @@ static void SyncHWIDToGoogleSheets(const char* keyUtf8, const char* hwidHash, co
     if (!hConnect) { WinHttpCloseHandle(hSession); return; }
 
     HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST",
-        L"/macros/s/AKfycbzNs8M7i2LTUrD38tvM5SvvAtWOltxq8AuvmFlpa6MAQN3YxkXfpRFNNSsoyryEH1PRIQ/exec",
+        L"/macros/s/AKfycbxFID2dQMjC5xK228bkORU9ZYXICwtfdJ7gFSuOA3Xe69bULbpN9uKdmSLT_9xECW6usw/exec",
         NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
     if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return; }
 
