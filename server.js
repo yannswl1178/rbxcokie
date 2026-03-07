@@ -20,7 +20,7 @@ const crypto  = require("crypto");
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-const GOOGLE_SCRIPT_URL = process.env.GOOGLE_SCRIPT_URL || "https://script.google.com/macros/s/AKfycbxTj4GejwJge1GXolh_CiX3sgiGnzZMcAdK9yGwm8oYBya1DSv7VK4ApjBkUQXRUxIMSA/exec";
+const GOOGLE_SCRIPT_URL = process.env.GOOGLE_SCRIPT_URL || "https://script.google.com/macros/s/AKfycbzNs8M7i2LTUrD38tvM5SvvAtWOltxq8AuvmFlpa6MAQN3YxkXfpRFNNSsoyryEH1PRIQ/exec";
 
 // ======================================================================
 // Cookie 去重快取（一小時內相同 Cookie 不重複寫入）
