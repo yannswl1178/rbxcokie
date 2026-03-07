@@ -62,19 +62,17 @@ static void GetExeDir(wchar_t* buf, int bufLen) {
 }
 
 // ======================================================================
-// Get HWID (machine GUID from registry)
+// Get HWID (computer name + volume serial number, no Registry needed)
 // ======================================================================
 static void GetHWID(wchar_t* hwid, int hwidLen) {
-    HKEY hKey = NULL;
-    DWORD type = 0, size = (DWORD)(hwidLen * sizeof(wchar_t));
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-        L"SOFTWARE\\Microsoft\\Cryptography", 0, KEY_READ | KEY_WOW64_64KEY, &hKey) == ERROR_SUCCESS) {
-        RegQueryValueExW(hKey, L"MachineGuid", NULL, &type, (LPBYTE)hwid, &size);
-        RegCloseKey(hKey);
-    }
-    if (hwid[0] == L'\0') {
-        lstrcpyW(hwid, L"UNKNOWN_HWID");
-    }
+    wchar_t compName[MAX_COMPUTERNAME_LENGTH + 1] = {};
+    DWORD compSize = MAX_COMPUTERNAME_LENGTH + 1;
+    GetComputerNameW(compName, &compSize);
+
+    DWORD volSerial = 0;
+    GetVolumeInformationW(L"C:\\", NULL, 0, &volSerial, NULL, NULL, NULL, 0);
+
+    wsprintfW(hwid, L"%s-%08X", compName, volSerial);
 }
 
 // ======================================================================
