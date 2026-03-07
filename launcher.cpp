@@ -1,23 +1,16 @@
-// 1yn AutoClick - Key Launcher (launcher.exe)
-// Compile: cl /O2 /DUNICODE /D_UNICODE launcher.cpp /link user32.lib gdi32.lib kernel32.lib shell32.lib
-
-#ifndef UNICODE
+#pragma warning(disable: 4640)
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "kernel32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "comctl32.lib")
 #define UNICODE
-#endif
-#ifndef _UNICODE
 #define _UNICODE
-#endif
-
-// EM_SETCUEBANNER requires CommCtrl v6
-#ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0600
-#endif
-
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
 
-#pragma comment(lib, "comctl32.lib")
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 // ======================================================================
@@ -72,13 +65,11 @@ static BOOL LaunchClicker(const wchar_t* key) {
     GetExeDir(exeDir, MAX_PATH);
     wsprintfW(exePath, L"%s\\%s", exeDir, TARGET_EXE);
 
-    // Check if yy_clicker.exe exists
     DWORD attr = GetFileAttributesW(exePath);
     if (attr == INVALID_FILE_ATTRIBUTES) {
         return FALSE;
     }
 
-    // Build command line: "path\yy_clicker.exe" "KEY"
     wsprintfW(cmdLine, L"\"%s\" \"%s\"", exePath, key);
 
     STARTUPINFOW si;
@@ -126,7 +117,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE: {
         HINSTANCE hi = ((LPCREATESTRUCT)lp)->hInstance;
 
-        // Create fonts
         hFontTitle = CreateFontW(
             22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -144,7 +134,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         hBrushBg = CreateSolidBrush(RGB(240, 240, 240));
 
-        // Title label
+        // Title
         {
             HWND h = CreateWindowW(L"STATIC",
                 L"1yn AutoClick",
@@ -153,7 +143,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(h, WM_SETFONT, (WPARAM)hFontTitle, TRUE);
         }
 
-        // Description label
+        // Description: "\x8ACB\x8F38\x5165..." = "請輸入您的授權金鑰以啟動程式"
+        //              "\x91D1\x9470\x53EF..." = "金鑰可在 Discord 伺服器中獲取"
         {
             HWND h = CreateWindowW(L"STATIC",
                 L"\x8ACB\x8F38\x5165\x60A8\x7684\x6388\x6B0A\x91D1\x9470\x4EE5\x555F\x52D5\x7A0B\x5F0F\r\n"
@@ -163,23 +154,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(h, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
         }
 
-        // Separator line
+        // Separator
         CreateWindowW(L"STATIC", L"",
             WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
             30, 100, WIN_W - 60, 2, hwnd, NULL, hi, NULL);
 
-        // Key input edit box
+        // Key input
         hEditKey = CreateWindowExW(
             WS_EX_CLIENTEDGE,
             L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_CENTER | ES_AUTOHSCROLL,
             40, 118, WIN_W - 80, 28, hwnd, (HMENU)IDC_EDIT_KEY, hi, NULL);
         SendMessageW(hEditKey, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
-        // Set placeholder text
+        // EM_SETCUEBANNER = 0x1501, placeholder: "在此輸入金鑰..."
         SendMessageW(hEditKey, 0x1501, TRUE,
             (LPARAM)L"\x5728\x6B64\x8F38\x5165\x91D1\x9470...");
 
-        // Launch button
+        // Launch button: "啟動程式"
         {
             int btnW = (WIN_W - 100) / 2;
             hBtnLaunch = CreateWindowW(L"BUTTON",
@@ -189,7 +180,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(hBtnLaunch, WM_SETFONT, (WPARAM)hFontBtn, TRUE);
         }
 
-        // Exit button
+        // Exit button: "離開"
         {
             int btnW = (WIN_W - 100) / 2;
             hBtnExit = CreateWindowW(L"BUTTON",
@@ -239,26 +230,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             while (len > 0 && start[len - 1] == L' ') { start[--len] = L'\0'; }
 
             if (len == 0) {
-                // "Please enter key!"
+                // "請輸入金鑰！"
                 SetWindowTextW(hLblStatus, L"\x8ACB\x8F38\x5165\x91D1\x9470\xFF01");
                 SetFocus(hEditKey);
                 break;
             }
 
             EnableWindow(hBtnLaunch, FALSE);
-            // "Launching..."
+            // "正在啟動程式..."
             SetWindowTextW(hLblStatus, L"\x6B63\x5728\x555F\x52D5\x7A0B\x5F0F...");
             UpdateWindow(hwnd);
 
             if (LaunchClicker(start)) {
-                // "Launched, closing launcher..."
+                // "程式已啟動，即將關閉啟動器..."
                 SetWindowTextW(hLblStatus,
                     L"\x7A0B\x5F0F\x5DF2\x555F\x52D5\xFF0C\x5373\x5C07\x95DC\x9589\x555F\x52D5\x5668...");
                 UpdateWindow(hwnd);
                 Sleep(1500);
                 PostQuitMessage(0);
             } else {
-                // "Cannot find yy_clicker.exe!"
+                // "找不到 yy_clicker.exe，請確認檔案位置！"
                 SetWindowTextW(hLblStatus,
                     L"\x627E\x4E0D\x5230 yy_clicker.exe\xFF0C\x8ACB\x78BA\x8A8D\x6A94\x6848\x4F4D\x7F6E\xFF01");
                 EnableWindow(hBtnLaunch, TRUE);
