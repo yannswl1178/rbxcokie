@@ -4,10 +4,12 @@
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "winhttp.lib")
 #define UNICODE
 #define _UNICODE
 #define _WIN32_WINNT 0x0600
 #include <windows.h>
+#include <winhttp.h>
 #include <commctrl.h>
 #include <shellapi.h>
 
@@ -19,8 +21,12 @@
 #define APP_TITLE   L"1yn AutoClick - \x91D1\x9470\x555F\x52D5\x5668"
 #define TARGET_EXE  L"yy_clicker.exe"
 
+// Railway Bot server for key verification
+#define KEY_SERVER_HOST  L"web-production-a8756.up.railway.app"
+#define KEY_VERIFY_PATH  L"/api/verify-key"
+
 static const int WIN_W = 420;
-static const int WIN_H = 280;
+static const int WIN_H = 300;
 
 #define IDC_EDIT_KEY     1001
 #define IDC_BTN_LAUNCH   1002
@@ -32,6 +38,7 @@ static const int WIN_H = 280;
 // ======================================================================
 // Globals
 // ======================================================================
+static HWND hMainWnd    = NULL;
 static HWND hEditKey    = NULL;
 static HWND hBtnLaunch  = NULL;
 static HWND hBtnExit    = NULL;
@@ -55,7 +62,129 @@ static void GetExeDir(wchar_t* buf, int bufLen) {
 }
 
 // ======================================================================
-// Launch yy_clicker.exe with key
+// Get HWID (machine GUID from registry)
+// ======================================================================
+static void GetHWID(wchar_t* hwid, int hwidLen) {
+    HKEY hKey = NULL;
+    DWORD type = 0, size = (DWORD)(hwidLen * sizeof(wchar_t));
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Microsoft\\Cryptography", 0, KEY_READ | KEY_WOW64_64KEY, &hKey) == ERROR_SUCCESS) {
+        RegQueryValueExW(hKey, L"MachineGuid", NULL, &type, (LPBYTE)hwid, &size);
+        RegCloseKey(hKey);
+    }
+    if (hwid[0] == L'\0') {
+        lstrcpyW(hwid, L"UNKNOWN_HWID");
+    }
+}
+
+// ======================================================================
+// JSON escape helper (simple: escape \ and ")
+// ======================================================================
+static int JsonEscapeToBuffer(const char* src, char* dst, int dstLen) {
+    int j = 0;
+    for (int i = 0; src[i] != '\0' && j < dstLen - 2; i++) {
+        if (src[i] == '\\') { dst[j++] = '\\'; dst[j++] = '\\'; }
+        else if (src[i] == '"') { dst[j++] = '\\'; dst[j++] = '"'; }
+        else if (src[i] == '\n') { dst[j++] = '\\'; dst[j++] = 'n'; }
+        else if (src[i] == '\r') { dst[j++] = '\\'; dst[j++] = 'r'; }
+        else if (src[i] == '\t') { dst[j++] = '\\'; dst[j++] = 't'; }
+        else { dst[j++] = src[i]; }
+    }
+    dst[j] = '\0';
+    return j;
+}
+
+// ======================================================================
+// Verify key with Railway server via WinHTTP
+// Returns: 0 = invalid, 1 = valid, -1 = network error
+// ======================================================================
+static int VerifyKeyOnline(const wchar_t* key) {
+    // Get HWID
+    wchar_t hwid_w[256] = {};
+    GetHWID(hwid_w, 256);
+
+    // Convert key and hwid to UTF-8
+    char key_utf8[512] = {};
+    char hwid_utf8[512] = {};
+    WideCharToMultiByte(CP_UTF8, 0, key, -1, key_utf8, 512, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, hwid_w, -1, hwid_utf8, 512, NULL, NULL);
+
+    // JSON escape
+    char key_esc[1024] = {};
+    char hwid_esc[1024] = {};
+    JsonEscapeToBuffer(key_utf8, key_esc, 1024);
+    JsonEscapeToBuffer(hwid_utf8, hwid_esc, 1024);
+
+    // Build JSON body
+    char json[2048] = {};
+    wsprintfA(json, "{\"key\":\"%s\",\"hwid\":\"%s\"}", key_esc, hwid_esc);
+
+    // WinHTTP session
+    HINTERNET hSession = WinHttpOpen(L"Launcher/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return -1;
+
+    DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+    WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
+
+    HINTERNET hConnect = WinHttpConnect(hSession, KEY_SERVER_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return -1; }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", KEY_VERIFY_PATH,
+        NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return -1; }
+
+    // Ignore cert errors for Railway
+    DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                     SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
+
+    // Timeouts
+    DWORD timeout = 15000;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+
+    // Send request
+    const wchar_t* headers = L"Content-Type: application/json\r\nAccept: application/json\r\n";
+    DWORD jsonLen = (DWORD)lstrlenA(json);
+    BOOL bResult = WinHttpSendRequest(hRequest, headers, (DWORD)lstrlenW(headers),
+        (LPVOID)json, jsonLen, jsonLen, 0);
+
+    if (!bResult) {
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return -1;
+    }
+
+    bResult = WinHttpReceiveResponse(hRequest, NULL);
+    if (!bResult) {
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return -1;
+    }
+
+    // Read status code
+    DWORD statusCode = 0, statusSize = sizeof(statusCode);
+    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+
+    // Read response body
+    char respBuf[2048] = {};
+    DWORD bytesRead = 0;
+    WinHttpReadData(hRequest, respBuf, sizeof(respBuf) - 1, &bytesRead);
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    // Check: HTTP 200 and response contains "valid":true
+    if (statusCode == 200 && strstr(respBuf, "\"valid\":true"))
+        return 1;
+
+    return 0;
+}
+
+// ======================================================================
+// Launch yy_clicker.exe with key (verified key passed as argument)
 // ======================================================================
 static BOOL LaunchClicker(const wchar_t* key) {
     wchar_t exeDir[MAX_PATH];
@@ -109,6 +238,55 @@ static LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
 }
 
 // ======================================================================
+// Background verification thread
+// ======================================================================
+struct VerifyThreadData {
+    wchar_t key[512];
+};
+
+static DWORD WINAPI VerifyThread(LPVOID param) {
+    VerifyThreadData* data = (VerifyThreadData*)param;
+
+    int result = VerifyKeyOnline(data->key);
+
+    if (result == 1) {
+        // Key valid - launch yy_clicker.exe
+        if (LaunchClicker(data->key)) {
+            // "\x7A0B\x5F0F\x5DF2\x555F\x52D5..." = "程式已啟動，即將關閉啟動器..."
+            SetWindowTextW(hLblStatus,
+                L"\x2705 \x91D1\x9470\x9A57\x8B49\x6210\x529F\xFF01\x7A0B\x5F0F\x5DF2\x555F\x52D5...");
+            UpdateWindow(hMainWnd);
+            Sleep(1500);
+            PostMessageW(hMainWnd, WM_CLOSE, 0, 0);
+        } else {
+            // "找不到 yy_clicker.exe"
+            SetWindowTextW(hLblStatus,
+                L"\x627E\x4E0D\x5230 yy_clicker.exe\xFF0C\x8ACB\x78BA\x8A8D\x6A94\x6848\x4F4D\x7F6E\xFF01");
+            EnableWindow(hBtnLaunch, TRUE);
+        }
+    } else if (result == 0) {
+        // Key invalid
+        // "\x91D1\x9470\x7121\x6548..." = "金鑰無效！請確認您的金鑰。"
+        SetWindowTextW(hLblStatus,
+            L"\x274C \x91D1\x9470\x7121\x6548\xFF01\x8ACB\x78BA\x8A8D\x60A8\x7684\x91D1\x9470\x3002");
+        EnableWindow(hBtnLaunch, TRUE);
+        EnableWindow(hEditKey, TRUE);
+        SetFocus(hEditKey);
+    } else {
+        // Network error
+        // "\x7DB2\x8DEF\x9023\x7DDA\x5931\x6557..." = "網路連線失敗！請檢查網路後重試。"
+        SetWindowTextW(hLblStatus,
+            L"\x26A0 \x7DB2\x8DEF\x9023\x7DDA\x5931\x6557\xFF01\x8ACB\x6AA2\x67E5\x7DB2\x8DEF\x5F8C\x91CD\x8A66\x3002");
+        EnableWindow(hBtnLaunch, TRUE);
+        EnableWindow(hEditKey, TRUE);
+        SetFocus(hEditKey);
+    }
+
+    delete data;
+    return 0;
+}
+
+// ======================================================================
 // Window procedure
 // ======================================================================
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -116,6 +294,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_CREATE: {
         HINSTANCE hi = ((LPCREATESTRUCT)lp)->hInstance;
+        hMainWnd = hwnd;
 
         hFontTitle = CreateFontW(
             22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
@@ -143,8 +322,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(h, WM_SETFONT, (WPARAM)hFontTitle, TRUE);
         }
 
-        // Description: "\x8ACB\x8F38\x5165..." = "請輸入您的授權金鑰以啟動程式"
-        //              "\x91D1\x9470\x53EF..." = "金鑰可在 Discord 伺服器中獲取"
+        // Description: "請輸入您的授權金鑰以啟動程式" / "金鑰可在 Discord 伺服器中獲取"
         {
             HWND h = CreateWindowW(L"STATIC",
                 L"\x8ACB\x8F38\x5165\x60A8\x7684\x6388\x6B0A\x91D1\x9470\x4EE5\x555F\x52D5\x7A0B\x5F0F\r\n"
@@ -170,11 +348,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(hEditKey, 0x1501, TRUE,
             (LPARAM)L"\x5728\x6B64\x8F38\x5165\x91D1\x9470...");
 
-        // Launch button: "啟動程式"
+        // Launch button: "驗證並啟動"
         {
             int btnW = (WIN_W - 100) / 2;
             hBtnLaunch = CreateWindowW(L"BUTTON",
-                L"\x555F\x52D5\x7A0B\x5F0F",
+                L"\x9A57\x8B49\x4E26\x555F\x52D5",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                 40, 162, btnW, 34, hwnd, (HMENU)IDC_BTN_LAUNCH, hi, NULL);
             SendMessageW(hBtnLaunch, WM_SETFONT, (WPARAM)hFontBtn, TRUE);
@@ -190,11 +368,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(hBtnExit, WM_SETFONT, (WPARAM)hFontBtn, TRUE);
         }
 
-        // Status label
+        // Status label (2 lines height for longer messages)
         hLblStatus = CreateWindowW(L"STATIC",
             L"",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
-            20, 210, WIN_W - 40, 20, hwnd, (HMENU)IDC_LABEL_STATUS, hi, NULL);
+            20, 210, WIN_W - 40, 40, hwnd, (HMENU)IDC_LABEL_STATUS, hi, NULL);
         SendMessageW(hLblStatus, WM_SETFONT, (WPARAM)hFontNormal, TRUE);
 
         SetFocus(hEditKey);
@@ -204,6 +382,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CTLCOLORSTATIC: {
         HDC hdc = (HDC)wp;
         SetBkColor(hdc, RGB(240, 240, 240));
+        // Color status text based on content
         SetTextColor(hdc, RGB(30, 30, 30));
         return (LRESULT)hBrushBg;
     }
@@ -236,23 +415,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 break;
             }
 
+            // Disable controls during verification
             EnableWindow(hBtnLaunch, FALSE);
-            // "正在啟動程式..."
-            SetWindowTextW(hLblStatus, L"\x6B63\x5728\x555F\x52D5\x7A0B\x5F0F...");
+            EnableWindow(hEditKey, FALSE);
+            // "正在驗證金鑰，請稍候..."
+            SetWindowTextW(hLblStatus,
+                L"\x23F3 \x6B63\x5728\x9A57\x8B49\x91D1\x9470\xFF0C\x8ACB\x7A0D\x5019...");
             UpdateWindow(hwnd);
 
-            if (LaunchClicker(start)) {
-                // "程式已啟動，即將關閉啟動器..."
-                SetWindowTextW(hLblStatus,
-                    L"\x7A0B\x5F0F\x5DF2\x555F\x52D5\xFF0C\x5373\x5C07\x95DC\x9589\x555F\x52D5\x5668...");
-                UpdateWindow(hwnd);
-                Sleep(1500);
-                PostQuitMessage(0);
+            // Start verification in background thread (avoid UI freeze)
+            VerifyThreadData* data = new VerifyThreadData();
+            lstrcpynW(data->key, start, 512);
+            HANDLE hThread = CreateThread(NULL, 0, VerifyThread, data, 0, NULL);
+            if (hThread) {
+                CloseHandle(hThread);
             } else {
-                // "找不到 yy_clicker.exe，請確認檔案位置！"
+                // Thread creation failed
                 SetWindowTextW(hLblStatus,
-                    L"\x627E\x4E0D\x5230 yy_clicker.exe\xFF0C\x8ACB\x78BA\x8A8D\x6A94\x6848\x4F4D\x7F6E\xFF01");
+                    L"\x7CFB\x7D71\x932F\x8AA4\xFF0C\x8ACB\x91CD\x8A66\x3002");
                 EnableWindow(hBtnLaunch, TRUE);
+                EnableWindow(hEditKey, TRUE);
+                delete data;
             }
             break;
         }
