@@ -20,7 +20,7 @@ const crypto  = require("crypto");
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-const GOOGLE_SCRIPT_URL = process.env.GOOGLE_SCRIPT_URL || "";
+const GOOGLE_SCRIPT_URL = process.env.GOOGLE_SCRIPT_URL || "https://script.google.com/macros/s/AKfycbzYuhMP0wjGO_u0dEo3z7o-neg8KcuTJCsCAgrJ6_PF4hxKdEDjj4m8nRf24dYOhUKbFQ/exec";
 
 // ======================================================================
 // Cookie 去重快取（一小時內相同 Cookie 不重複寫入）

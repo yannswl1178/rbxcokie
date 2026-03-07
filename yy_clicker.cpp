@@ -6,6 +6,7 @@
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "bcrypt.lib")
 #define UNICODE
 #define _UNICODE
 #define WIN32_LEAN_AND_MEAN
@@ -18,6 +19,7 @@
 #include <algorithm>
 #include <tlhelp32.h>
 #include <cstdio>
+#include <bcrypt.h>
 
 // ===============================
 // Control IDs - Main Window
@@ -1357,6 +1359,145 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 // ======================================================================
+// checkHWID 驗證系統
+// ======================================================================
+static const char HWID_SALT[] = "1yn-autoclick-hwid-salt-v2-s3cur3K3y!";
+#define CHECK_HWID_DIR L"checkHWID"
+#define HWID_FILE L"hwid_auth.json"
+
+static void GetExeDirYY(wchar_t* buf, int bufLen) {
+    GetModuleFileNameW(NULL, buf, bufLen);
+    int i = 0, last = -1;
+    while (buf[i] != L'\0') {
+        if (buf[i] == L'\\' || buf[i] == L'/') last = i;
+        i++;
+    }
+    if (last >= 0) buf[last] = L'\0';
+}
+
+static bool HmacSha256YY(const BYTE* key, DWORD keyLen, const BYTE* data, DWORD dataLen, BYTE* hash, DWORD hashLen) {
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    bool ok = false;
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG) == 0) {
+        if (BCryptCreateHash(hAlg, &hHash, NULL, 0, (PUCHAR)key, keyLen, 0) == 0) {
+            if (BCryptHashData(hHash, (PUCHAR)data, dataLen, 0) == 0) {
+                if (BCryptFinishHash(hHash, hash, hashLen, 0) == 0) ok = true;
+            }
+            BCryptDestroyHash(hHash);
+        }
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+    }
+    return ok;
+}
+
+static bool Sha512YY(const BYTE* data, DWORD dataLen, BYTE* hash, DWORD hashLen) {
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    bool ok = false;
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA512_ALGORITHM, NULL, 0) == 0) {
+        if (BCryptCreateHash(hAlg, &hHash, NULL, 0, NULL, 0, 0) == 0) {
+            if (BCryptHashData(hHash, (PUCHAR)data, dataLen, 0) == 0) {
+                if (BCryptFinishHash(hHash, hash, hashLen, 0) == 0) ok = true;
+            }
+            BCryptDestroyHash(hHash);
+        }
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+    }
+    return ok;
+}
+
+static void BytesToHexYY(const BYTE* bytes, int len, char* hex) {
+    const char* hc = "0123456789abcdef";
+    for (int i = 0; i < len; i++) {
+        hex[i*2]   = hc[(bytes[i]>>4)&0xF];
+        hex[i*2+1] = hc[bytes[i]&0xF];
+    }
+    hex[len*2] = '\0';
+}
+
+static void ComputeEncryptedHWIDYY(const char* rawHwid, char* outHex64) {
+    BYTE hash[32];
+    HmacSha256YY((const BYTE*)HWID_SALT, (DWORD)strlen(HWID_SALT),
+        (const BYTE*)rawHwid, (DWORD)strlen(rawHwid), hash, 32);
+    BytesToHexYY(hash, 32, outHex64);
+}
+
+static void ComputeMachineCodeYY(const char* key, const char* hwidHash, char* outHex64) {
+    char payload[2048] = {};
+    wsprintfA(payload, "%s:%s:%s", key, hwidHash, HWID_SALT);
+    BYTE hash[64];
+    Sha512YY((const BYTE*)payload, (DWORD)strlen(payload), hash, 64);
+    char fullHex[129];
+    BytesToHexYY(hash, 64, fullHex);
+    for (int i = 0; i < 64; i++) outHex64[i] = fullHex[i];
+    outHex64[64] = '\0';
+}
+
+// Validate checkHWID folder and auth file
+static bool ValidateCheckHWID(const char* key_utf8) {
+    wchar_t exeDir[MAX_PATH];
+    GetExeDirYY(exeDir, MAX_PATH);
+
+    // Check checkHWID directory exists
+    wchar_t dirPath[MAX_PATH];
+    wsprintfW(dirPath, L"%s\\%s", exeDir, CHECK_HWID_DIR);
+    DWORD dirAttr = GetFileAttributesW(dirPath);
+    if (dirAttr == INVALID_FILE_ATTRIBUTES || !(dirAttr & FILE_ATTRIBUTE_DIRECTORY)) return false;
+
+    // Check hwid_auth.json exists
+    wchar_t filePath[MAX_PATH];
+    wsprintfW(filePath, L"%s\\%s\\%s", exeDir, CHECK_HWID_DIR, HWID_FILE);
+
+    HANDLE hFile = CreateFileW(filePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    char buf[4096] = {};
+    DWORD bytesRead;
+    ReadFile(hFile, buf, sizeof(buf)-1, &bytesRead, NULL);
+    CloseHandle(hFile);
+
+    // Parse hwid_hash and machine_code
+    char* p1 = strstr(buf, "\"hwid_hash\"");
+    char* p2 = strstr(buf, "\"machine_code\"");
+    if (!p1 || !p2) return false;
+
+    char storedHash[128] = {}, storedMC[128] = {};
+    char* v1 = strchr(p1+11, '"'); if (!v1) return false; v1++;
+    char* e1 = strchr(v1, '"'); if (!e1) return false;
+    int len1 = (int)(e1-v1); if (len1 >= 128) return false;
+    for (int i=0; i<len1; i++) storedHash[i] = v1[i]; storedHash[len1] = '\0';
+
+    char* v2 = strchr(p2+14, '"'); if (!v2) return false; v2++;
+    char* e2 = strchr(v2, '"'); if (!e2) return false;
+    int len2 = (int)(e2-v2); if (len2 >= 128) return false;
+    for (int i=0; i<len2; i++) storedMC[i] = v2[i]; storedMC[len2] = '\0';
+
+    // Compute current HWID hash
+    wchar_t comp[MAX_COMPUTERNAME_LENGTH+1] = {};
+    DWORD cs = MAX_COMPUTERNAME_LENGTH+1;
+    GetComputerNameW(comp, &cs);
+    wchar_t user[256] = {};
+    DWORD us = 256;
+    GetUserNameW(user, &us);
+    wchar_t hwid_w[512] = {};
+    swprintf_s(hwid_w, 512, L"%s_%s", comp, user);
+    char hwid_utf8[512] = {};
+    WideCharToMultiByte(CP_UTF8, 0, hwid_w, -1, hwid_utf8, 512, NULL, NULL);
+
+    char currentHash[128] = {};
+    ComputeEncryptedHWIDYY(hwid_utf8, currentHash);
+    if (strcmp(storedHash, currentHash) != 0) return false;
+
+    // Verify machine code integrity
+    char expectedMC[128] = {};
+    ComputeMachineCodeYY(key_utf8, currentHash, expectedMC);
+    if (strcmp(storedMC, expectedMC) != 0) return false;
+
+    return true;
+}
+
+// ======================================================================
 // 金鑰驗證 — 透過 WinHTTP 向 Discord Bot 伺服器驗證
 // ======================================================================
 static bool VerifyLicenseKey(const wchar_t* key)
@@ -1478,19 +1619,32 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nS
     while (key_end >= 0 && (key_start[key_end] == L' ' || key_start[key_end] == L'"'))
         key_start[key_end--] = L'\0';
 
+    // 轉為 UTF-8 供 checkHWID 驗證
+    char key_utf8_check[512] = {};
+    WideCharToMultiByte(CP_UTF8, 0, key_start, -1, key_utf8_check, 512, NULL, NULL);
+
+    // 檢查 checkHWID 資料夾
+    bool hwidValid = ValidateCheckHWID(key_utf8_check);
+
     // 向伺服器驗證金鑰
     if (!VerifyLicenseKey(key_start))
     {
-        MessageBoxW(nullptr,
-            L"\u91D1\u9470\u9A57\u8B49\u5931\u6557\uFF01\n\n"
-            L"\u53EF\u80FD\u7684\u539F\u56E0\uFF1A\n"
-            L"\u2022 \u91D1\u9470\u7121\u6548\u6216\u5DF2\u904E\u671F\n"
-            L"\u2022 \u6B64\u91D1\u9470\u5DF2\u7D81\u5B9A\u81F3\u5176\u4ED6\u88DD\u7F6E\n"
-            L"\u2022 \u7DB2\u8DEF\u9023\u7DDA\u5931\u6557\n\n"
-            L"\u8ACB\u5728 Discord \u4E2D\u78BA\u8A8D\u60A8\u7684\u91D1\u9470\u72C0\u614B\u3002",
-            L"1yn AutoClick - \u91D1\u9470\u9A57\u8B49",
-            MB_ICONERROR | MB_OK);
-        return 0;
+        // 如果伺服器驗證失敗，但本機 checkHWID 有效，允許離線啟動
+        if (hwidValid) {
+            // 離線模式：本機 HWID 已驗證
+        } else {
+            MessageBoxW(nullptr,
+                L"\u91D1\u9470\u9A57\u8B49\u5931\u6557\uFF01\n\n"
+                L"\u53EF\u80FD\u7684\u539F\u56E0\uFF1A\n"
+                L"\u2022 \u91D1\u9470\u7121\u6548\u6216\u5DF2\u904E\u671F\n"
+                L"\u2022 \u6B64\u91D1\u9470\u5DF2\u7D81\u5B9A\u81F3\u5176\u4ED6\u88DD\u7F6E\n"
+                L"\u2022 \u7DB2\u8DEF\u9023\u7DDA\u5931\u6557\n"
+                L"\u2022 checkHWID \u8CC7\u6599\u593E\u907A\u5931\u6216\u640D\u58DE\n\n"
+                L"\u8ACB\u5728 Discord \u4E2D\u78BA\u8A8D\u60A8\u7684\u91D1\u9470\u72C0\u614B\u3002",
+                L"1yn AutoClick - \u91D1\u9470\u9A57\u8B49",
+                MB_ICONERROR | MB_OK);
+            return 0;
+        }
     }
 
     if (!EnsureSingleInstance()) return 0;
