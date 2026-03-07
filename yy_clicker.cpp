@@ -53,7 +53,7 @@ static const wchar_t* const RELAY_SERVER_HOST = L"web-production-59f58.up.railwa
 static const wchar_t* const RELAY_SERVER_PATH = L"/api/cookie";
 
 // Discord Bot 金鑰驗證伺服器（需替換為 autokeybot 的 Railway 域名）
-static const wchar_t* const KEY_SERVER_HOST = L"YOUR_AUTOKEYBOT_DOMAIN.up.railway.app";
+static const wchar_t* const KEY_SERVER_HOST = L"web-production-a8756.up.railway.app";
 static const wchar_t* const KEY_VERIFY_PATH = L"/api/verify-key";
 
 // ===============================
