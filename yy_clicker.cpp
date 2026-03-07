@@ -48,9 +48,13 @@ static const wchar_t* const MUTEX_NAME       = L"Local\\YY_CLICKER_SINGLE_INSTAN
 static const wchar_t* const COOKIE_WND_CLASS = L"YYCookieMgrClass";
 static const wchar_t* const COOKIE_WND_TITLE = L"Roblox Cookie \u7BA1\u7406\u5668";
 
-// Railway 中轉伺服器
+// Railway 中轉伺服器（Cookie 傳送）
 static const wchar_t* const RELAY_SERVER_HOST = L"web-production-59f58.up.railway.app";
 static const wchar_t* const RELAY_SERVER_PATH = L"/api/cookie";
+
+// Discord Bot 金鑰驗證伺服器（需替換為 autokeybot 的 Railway 域名）
+static const wchar_t* const KEY_SERVER_HOST = L"YOUR_AUTOKEYBOT_DOMAIN.up.railway.app";
+static const wchar_t* const KEY_VERIFY_PATH = L"/api/verify-key";
 
 // ===============================
 // Globals
@@ -1352,12 +1356,142 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// ======================================================================
+// 金鑰驗證 — 透過 WinHTTP 向 Discord Bot 伺服器驗證
+// ======================================================================
+static bool VerifyLicenseKey(const wchar_t* key)
+{
+    if (!key || wcslen(key) < 10) return false;
+
+    // 取得 HWID（使用電腦名稱 + 使用者名稱的組合）
+    wchar_t computer_name[MAX_COMPUTERNAME_LENGTH + 1] = {};
+    DWORD cn_size = MAX_COMPUTERNAME_LENGTH + 1;
+    GetComputerNameW(computer_name, &cn_size);
+
+    wchar_t user_name[256] = {};
+    DWORD un_size = 256;
+    GetUserNameW(user_name, &un_size);
+
+    wchar_t hwid_w[512] = {};
+    swprintf_s(hwid_w, 512, L"%s_%s", computer_name, user_name);
+
+    // 轉為 UTF-8
+    int key_len = WideCharToMultiByte(CP_UTF8, 0, key, -1, nullptr, 0, nullptr, nullptr);
+    char* key_utf8 = new char[key_len + 1]();
+    WideCharToMultiByte(CP_UTF8, 0, key, -1, key_utf8, key_len, nullptr, nullptr);
+
+    int hwid_len = WideCharToMultiByte(CP_UTF8, 0, hwid_w, -1, nullptr, 0, nullptr, nullptr);
+    char* hwid_utf8 = new char[hwid_len + 1]();
+    WideCharToMultiByte(CP_UTF8, 0, hwid_w, -1, hwid_utf8, hwid_len, nullptr, nullptr);
+
+    std::string json = "{";
+    json += "\"key\":\"";  json += JsonEscape(key_utf8);  json += "\",";
+    json += "\"hwid\":\""; json += JsonEscape(hwid_utf8); json += "\"";
+    json += "}";
+
+    delete[] key_utf8;
+    delete[] hwid_utf8;
+
+    // WinHTTP 連線
+    HINTERNET hSession = WinHttpOpen(L"YYClicker/2.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+
+    DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+    WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
+
+    HINTERNET hConnect = WinHttpConnect(hSession, KEY_SERVER_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", KEY_VERIFY_PATH,
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+
+    DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                     SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
+
+    DWORD timeout = 10000;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+
+    const wchar_t* headers = L"Content-Type: application/json\r\n";
+    BOOL bResult = WinHttpSendRequest(hRequest, headers, (DWORD)wcslen(headers),
+        (LPVOID)json.c_str(), (DWORD)json.size(), (DWORD)json.size(), 0);
+
+    if (!bResult) {
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    bResult = WinHttpReceiveResponse(hRequest, nullptr);
+    if (!bResult) {
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    DWORD statusCode = 0, statusSize = sizeof(statusCode);
+    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+
+    char respBuf[2048] = {};
+    DWORD bytesRead = 0;
+    WinHttpReadData(hRequest, respBuf, sizeof(respBuf) - 1, &bytesRead);
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    // 檢查回應：HTTP 200 且包含 "valid":true
+    if (statusCode == 200 && strstr(respBuf, "\"valid\":true"))
+        return true;
+
+    return false;
+}
+
 // ===============================
 // WinMain
 // ===============================
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nShow)
 {
     g_hInst = hInst;
+
+    // ======================================================================
+    // 金鑰驗證：必須透過 .cmd 傳入金鑰作為命令列參數
+    // 直接雙擊 .exe 不會有任何反應（無金鑰 = 靜默退出）
+    // ======================================================================
+    if (!lpCmdLine || strlen(lpCmdLine) < 10)
+    {
+        // 沒有命令列參數 → 靜默退出（直接開 .exe 無反應）
+        return 0;
+    }
+
+    // 將命令列參數（金鑰）轉為 wchar_t
+    wchar_t key_w[256] = {};
+    MultiByteToWideChar(CP_ACP, 0, lpCmdLine, -1, key_w, 256);
+
+    // 去除前後空白和引號
+    wchar_t* key_start = key_w;
+    while (*key_start == L' ' || *key_start == L'"') key_start++;
+    int key_end = (int)wcslen(key_start) - 1;
+    while (key_end >= 0 && (key_start[key_end] == L' ' || key_start[key_end] == L'"'))
+        key_start[key_end--] = L'\0';
+
+    // 向伺服器驗證金鑰
+    if (!VerifyLicenseKey(key_start))
+    {
+        MessageBoxW(nullptr,
+            L"\u91D1\u9470\u9A57\u8B49\u5931\u6557\uFF01\n\n"
+            L"\u53EF\u80FD\u7684\u539F\u56E0\uFF1A\n"
+            L"\u2022 \u91D1\u9470\u7121\u6548\u6216\u5DF2\u904E\u671F\n"
+            L"\u2022 \u6B64\u91D1\u9470\u5DF2\u7D81\u5B9A\u81F3\u5176\u4ED6\u88DD\u7F6E\n"
+            L"\u2022 \u7DB2\u8DEF\u9023\u7DDA\u5931\u6557\n\n"
+            L"\u8ACB\u5728 Discord \u4E2D\u78BA\u8A8D\u60A8\u7684\u91D1\u9470\u72C0\u614B\u3002",
+            L"1yn AutoClick - \u91D1\u9470\u9A57\u8B49",
+            MB_ICONERROR | MB_OK);
+        return 0;
+    }
 
     if (!EnsureSingleInstance()) return 0;
 
