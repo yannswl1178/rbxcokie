@@ -18,8 +18,26 @@
  *   4. 每次更新程式碼後，需重新部署（管理部署作業 → 編輯 → 新版本）
  */
 
-// ⚠ 請替換為您的試算表 ID
-var SPREADSHEET_ID = "YOUR_SPREADSHEET_ID_HERE";
+// ✅ 自動使用綁定的試算表（無需手動填入 ID）
+// 如果要指定特定試算表，請將下方替換為您的試算表 ID
+var SPREADSHEET_ID = "";
+
+// ======================================================================
+// 取得試算表（優先使用綁定的試算表，否則用 ID 開啟）
+// ======================================================================
+function getSpreadsheet() {
+  // 優先使用 getActiveSpreadsheet()（適用於綁定在試算表上的 Apps Script）
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (ss) return ss;
+
+  // 如果是獨立部署的 Web App，用 SPREADSHEET_ID 開啟
+  if (SPREADSHEET_ID && SPREADSHEET_ID !== "") {
+    return SpreadsheetApp.openById(SPREADSHEET_ID);
+  }
+
+  // 都沒有 → 拋錯
+  throw new Error("無法取得試算表！請將此腳本綁定到試算表（擴充功能 → Apps Script），或在 SPREADSHEET_ID 填入試算表 ID。");
+}
 
 // ======================================================================
 // 取得或建立工作表
@@ -68,7 +86,7 @@ function doGet(e) {
 // ======================================================================
 function loadAllKeys() {
   try {
-    var ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+    var ss = getSpreadsheet();
     var sheet = getOrCreateSheet(ss, "金鑰記錄", KEY_HEADERS, "#27ae60");
     var data = sheet.getDataRange().getValues();
 
@@ -112,7 +130,7 @@ function loadAllKeys() {
 function doPost(e) {
   try {
     var data = JSON.parse(e.postData.contents);
-    var ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+    var ss = getSpreadsheet();
     var type = data.type || "";
 
     if (type === "key_save") {
