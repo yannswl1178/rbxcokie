@@ -1,5 +1,5 @@
 /**
- * 1ynkeycheck.exe — 金鑰驗證啟動器（雙 Key 系統）
+ * 1ynkeycheck.exe — 金鑰驗證啟動器（雙 Key 系統 + 增強型 HWID）
  *
  * 此程式只接受「金鑰」（1YN- 格式，License Key），
  * 不接受「密鑰」（SEC- 格式，Secret Key）。
@@ -7,8 +7,12 @@
  * 流程：
  *   1. 用戶輸入金鑰（1YN-XXXX-XXXX-XXXX-XXXX）
  *   2. 向 Discord Bot 伺服器驗證金鑰 + HWID 綁定
- *   3. 驗證成功 → 在 checkHWID 資料夾生成加密 HWID 檔案
+ *   3. 驗證成功 → 在 checkHWID 資料夾生成加密 HWID 檔案（含 session_token）
  *   4. 啟動 yy_clicker.exe 並傳入金鑰
+ *   5. 自動關閉啟動器
+ *
+ * 增強型 HWID：電腦名稱 + 使用者名稱 + 磁碟序號 + CPU ID
+ * Session Token：UUID 格式，防止 checkHWID 資料夾被複製到其他電腦
  *
  * 編譯：
  *   cl /EHsc /Fe:1ynkeycheck.exe launcher.cpp /link bcrypt.lib
@@ -22,6 +26,7 @@
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "ole32.lib")
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 #define UNICODE
@@ -32,8 +37,10 @@
 #include <winhttp.h>
 #include <commctrl.h>
 #include <bcrypt.h>
+#include <objbase.h>
 #include <string>
 #include <cstdio>
+#include <intrin.h>
 
 // ======================================================================
 // 常數
@@ -180,9 +187,60 @@ static void ComputeMachineCode(const char* key, const char* hwidHash, char* outH
 }
 
 // ======================================================================
-// 取得原始 HWID 字串（電腦名稱_使用者名稱）
+// 增強型 HWID 計算（電腦名稱 + 使用者名稱 + 磁碟序號 + CPU ID）
 // ======================================================================
-static void GetRawHWID(char* outUtf8, int bufSize) {
+
+// 取得磁碟序號（C: 磁碟）
+static void GetDiskSerial(char* outBuf, int bufSize) {
+    DWORD serialNumber = 0;
+    if (GetVolumeInformationA("C:\\", NULL, 0, &serialNumber, NULL, NULL, NULL, 0)) {
+        sprintf_s(outBuf, bufSize, "%08lX", serialNumber);
+    } else {
+        strcpy_s(outBuf, bufSize, "UNKNOWN_DISK");
+    }
+}
+
+// 取得 CPU ID
+static void GetCpuId(char* outBuf, int bufSize) {
+    int cpuInfo[4] = { 0 };
+    __cpuid(cpuInfo, 0);
+    int nIds = cpuInfo[0];
+
+    if (nIds >= 1) {
+        __cpuid(cpuInfo, 1);
+        sprintf_s(outBuf, bufSize, "%08X%08X", cpuInfo[3], cpuInfo[0]);
+    } else {
+        strcpy_s(outBuf, bufSize, "UNKNOWN_CPU");
+    }
+}
+
+// 增強型原始 HWID
+static void GetEnhancedRawHWID(char* outUtf8, int bufSize) {
+    wchar_t comp[MAX_COMPUTERNAME_LENGTH + 1] = {};
+    DWORD cs = MAX_COMPUTERNAME_LENGTH + 1;
+    GetComputerNameW(comp, &cs);
+
+    wchar_t user[256] = {};
+    DWORD us = 256;
+    GetUserNameW(user, &us);
+
+    char diskSerial[32] = {};
+    GetDiskSerial(diskSerial, 32);
+
+    char cpuId[32] = {};
+    GetCpuId(cpuId, 32);
+
+    wchar_t hwid_w[1024] = {};
+    swprintf_s(hwid_w, 1024, L"%s_%s", comp, user);
+
+    char compUser[512] = {};
+    WideCharToMultiByte(CP_UTF8, 0, hwid_w, -1, compUser, 512, NULL, NULL);
+
+    sprintf_s(outUtf8, bufSize, "%s_%s_%s", compUser, diskSerial, cpuId);
+}
+
+// 向後相容：舊版原始 HWID
+static void GetLegacyRawHWID(char* outUtf8, int bufSize) {
     wchar_t comp[MAX_COMPUTERNAME_LENGTH + 1] = {};
     DWORD cs = MAX_COMPUTERNAME_LENGTH + 1;
     GetComputerNameW(comp, &cs);
@@ -197,7 +255,30 @@ static void GetRawHWID(char* outUtf8, int bufSize) {
 }
 
 // ======================================================================
-// 建立 checkHWID 資料夾並寫入 hwid_auth.json
+// 產生 Session Token（UUID 格式）
+// ======================================================================
+static void GenerateSessionToken(char* outBuf, int bufSize) {
+    GUID guid;
+    if (CoCreateGuid(&guid) == S_OK) {
+        sprintf_s(outBuf, bufSize,
+            "%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            guid.Data1, guid.Data2, guid.Data3,
+            guid.Data4[0], guid.Data4[1], guid.Data4[2], guid.Data4[3],
+            guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+    } else {
+        // Fallback: 使用時間戳 + 隨機數
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        srand(GetTickCount());
+        sprintf_s(outBuf, bufSize, "%04d%02d%02d-%02d%02d%02d-%08x-%08x",
+            st.wYear, st.wMonth, st.wDay,
+            st.wHour, st.wMinute, st.wSecond,
+            rand() * rand(), rand() * rand());
+    }
+}
+
+// ======================================================================
+// 建立 checkHWID 資料夾並寫入 hwid_auth.json（含 session_token）
 // ======================================================================
 static bool CreateCheckHWID(const char* keyUtf8) {
     wchar_t exeDir[MAX_PATH];
@@ -211,15 +292,19 @@ static bool CreateCheckHWID(const char* keyUtf8) {
     // 設定資料夾為隱藏+系統
     SetFileAttributesW(dirPath, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
 
-    // 計算加密 HWID
+    // 計算增強型加密 HWID
     char rawHwid[512] = {};
-    GetRawHWID(rawHwid, 512);
+    GetEnhancedRawHWID(rawHwid, 512);
 
     char hwidHash[128] = {};
     ComputeEncryptedHWID(rawHwid, hwidHash);
 
     char machineCode[128] = {};
     ComputeMachineCode(keyUtf8, hwidHash, machineCode);
+
+    // 產生 Session Token（UUID）
+    char sessionToken[64] = {};
+    GenerateSessionToken(sessionToken, 64);
 
     // 取得時間戳
     SYSTEMTIME st;
@@ -228,17 +313,18 @@ static bool CreateCheckHWID(const char* keyUtf8) {
     sprintf(timestamp, "%04d-%02d-%02dT%02d:%02d:%02d",
         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
 
-    // 寫入 JSON
-    char json[2048];
+    // 寫入 JSON（含 session_token）
+    char json[4096];
     sprintf(json,
         "{\n"
         "  \"hwid_hash\": \"%s\",\n"
         "  \"machine_code\": \"%s\",\n"
+        "  \"session_token\": \"%s\",\n"
         "  \"key\": \"%s\",\n"
         "  \"created_at\": \"%s\",\n"
-        "  \"version\": \"2.0\"\n"
+        "  \"version\": \"3.0\"\n"
         "}",
-        hwidHash, machineCode, keyUtf8, timestamp);
+        hwidHash, machineCode, sessionToken, keyUtf8, timestamp);
 
     wchar_t filePath[MAX_PATH];
     wsprintfW(filePath, L"%s\\%s\\%s", exeDir, CHECK_HWID_DIR, HWID_FILE);
@@ -254,32 +340,39 @@ static bool CreateCheckHWID(const char* keyUtf8) {
 }
 
 // ======================================================================
-// JSON 字串轉義
+// JSON 字串轉義（完整版）
 // ======================================================================
 static std::string JsonEscape(const char* raw) {
     std::string out;
     if (!raw) return out;
+    out.reserve(strlen(raw) + 64);
     for (const char* p = raw; *p; ++p) {
         switch (*p) {
         case '"':  out += "\\\""; break;
         case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b";  break;
+        case '\f': out += "\\f";  break;
         case '\n': out += "\\n";  break;
         case '\r': out += "\\r";  break;
         case '\t': out += "\\t";  break;
-        default:   out += *p;     break;
+        default:
+            if ((unsigned char)*p < 0x20) {
+                char hex[8];
+                sprintf(hex, "\\u%04x", (unsigned char)*p);
+                out += hex;
+            } else {
+                out += *p;
+            }
+            break;
         }
     }
     return out;
 }
 
 // ======================================================================
-// 同步 HWID 到 Google Sheets
+// 同步 HWID + Session Token 到 Google Sheets
 // ======================================================================
-static void SyncHWIDToGoogleSheets(const char* keyUtf8, const char* hwidHash, const char* machineCode) {
-    // 解析 Google Script URL 的 host 和 path
-    // Host: script.google.com
-    // Path: /macros/s/.../exec
-
+static void SyncHWIDToGoogleSheets(const char* keyUtf8, const char* hwidHash, const char* machineCode, const char* sessionToken) {
     HINTERNET hSession = WinHttpOpen(L"1ynKeyCheck/2.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return;
@@ -310,10 +403,55 @@ static void SyncHWIDToGoogleSheets(const char* keyUtf8, const char* hwidHash, co
 
     std::string json = "{";
     json += "\"action\":\"hwid_bind\",";
-    json += "\"license_key\":\""; json += JsonEscape(keyUtf8); json += "\",";
-    json += "\"hwid_hash\":\"";   json += JsonEscape(hwidHash); json += "\",";
-    json += "\"machine_code\":\""; json += JsonEscape(machineCode); json += "\"";
+    json += "\"license_key\":\"";     json += JsonEscape(keyUtf8);      json += "\",";
+    json += "\"hwid_hash\":\"";       json += JsonEscape(hwidHash);     json += "\",";
+    json += "\"machine_code\":\"";    json += JsonEscape(machineCode);  json += "\",";
+    json += "\"session_token\":\"";   json += JsonEscape(sessionToken); json += "\"";
     json += "}";
+
+    const wchar_t* headers = L"Content-Type: application/json\r\n";
+    WinHttpSendRequest(hRequest, headers, (DWORD)wcslen(headers),
+        (LPVOID)json.c_str(), (DWORD)json.size(), (DWORD)json.size(), 0);
+    WinHttpReceiveResponse(hRequest, NULL);
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+}
+
+// ======================================================================
+// 同步 Session Token 到 Discord Bot 伺服器
+// ======================================================================
+static void SyncSessionTokenToBot(const char* keyUtf8, const char* hwidHash, const char* machineCode, const char* sessionToken) {
+    std::string json = "{";
+    json += "\"key\":\"";             json += JsonEscape(keyUtf8);      json += "\",";
+    json += "\"hwid_hash\":\"";       json += JsonEscape(hwidHash);     json += "\",";
+    json += "\"machine_code\":\"";    json += JsonEscape(machineCode);  json += "\",";
+    json += "\"session_token\":\"";   json += JsonEscape(sessionToken); json += "\"";
+    json += "}";
+
+    HINTERNET hSession = WinHttpOpen(L"1ynKeyCheck/2.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return;
+
+    DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+    WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
+
+    HINTERNET hConnect = WinHttpConnect(hSession, KEY_SERVER_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return; }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", L"/api/update-session",
+        NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return; }
+
+    DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                     SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
+
+    DWORD timeout = 10000;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
 
     const wchar_t* headers = L"Content-Type: application/json\r\n";
     WinHttpSendRequest(hRequest, headers, (DWORD)wcslen(headers),
@@ -332,9 +470,9 @@ static void SyncHWIDToGoogleSheets(const char* keyUtf8, const char* hwidHash, co
 static int VerifyKey(const wchar_t* key) {
     if (!key || wcslen(key) < 10) return 1;
 
-    // 取得 HWID
+    // 取得增強型 HWID
     char rawHwid[512] = {};
-    GetRawHWID(rawHwid, 512);
+    GetEnhancedRawHWID(rawHwid, 512);
 
     // 轉為 UTF-8
     int keyLen = WideCharToMultiByte(CP_UTF8, 0, key, -1, NULL, 0, NULL, NULL);
@@ -415,6 +553,27 @@ static int VerifyKey(const wchar_t* key) {
 }
 
 // ======================================================================
+// JSON 解析輔助
+// ======================================================================
+static bool ParseJsonString(const char* json, const char* fieldName, char* outBuf, int bufSize) {
+    char searchKey[128] = {};
+    sprintf_s(searchKey, 128, "\"%s\"", fieldName);
+    const char* p = strstr(json, searchKey);
+    if (!p) return false;
+    p += strlen(searchKey);
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+    if (*p != '"') return false;
+    p++;
+    const char* end = strchr(p, '"');
+    if (!end) return false;
+    int len = (int)(end - p);
+    if (len >= bufSize) return false;
+    for (int i = 0; i < len; i++) outBuf[i] = p[i];
+    outBuf[len] = '\0';
+    return true;
+}
+
+// ======================================================================
 // 驗證執行緒資料
 // ======================================================================
 struct VerifyThreadData {
@@ -428,25 +587,43 @@ static DWORD WINAPI VerifyThread(LPVOID lpParam) {
     int result = VerifyKey(data->key);
 
     if (result == 0) {
-        // 驗證成功 → 建立 checkHWID 資料夾
+        // 驗證成功 → 建立 checkHWID 資料夾（含 session_token）
         char keyUtf8[512] = {};
         WideCharToMultiByte(CP_UTF8, 0, data->key, -1, keyUtf8, 512, NULL, NULL);
 
         CreateCheckHWID(keyUtf8);
 
-        // 同步 HWID 到 Google Sheets（背景執行，不阻塞）
+        // 讀取剛建立的 session_token
+        wchar_t exeDir[MAX_PATH];
+        GetExeDir(exeDir, MAX_PATH);
+        wchar_t filePath[MAX_PATH];
+        wsprintfW(filePath, L"%s\\%s\\%s", exeDir, CHECK_HWID_DIR, HWID_FILE);
+
+        char sessionToken[128] = {};
+        HANDLE hFile = CreateFileW(filePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            char buf[8192] = {};
+            DWORD br;
+            ReadFile(hFile, buf, sizeof(buf) - 1, &br, NULL);
+            CloseHandle(hFile);
+            ParseJsonString(buf, "session_token", sessionToken, 128);
+        }
+
+        // 計算 HWID 資訊
         char rawHwid[512] = {};
-        GetRawHWID(rawHwid, 512);
+        GetEnhancedRawHWID(rawHwid, 512);
         char hwidHash[128] = {};
         ComputeEncryptedHWID(rawHwid, hwidHash);
         char machineCode[128] = {};
         ComputeMachineCode(keyUtf8, hwidHash, machineCode);
-        SyncHWIDToGoogleSheets(keyUtf8, hwidHash, machineCode);
+
+        // 同步到 Google Sheets（含 session_token）
+        SyncHWIDToGoogleSheets(keyUtf8, hwidHash, machineCode, sessionToken);
+
+        // 同步 session_token 到 Discord Bot 伺服器
+        SyncSessionTokenToBot(keyUtf8, hwidHash, machineCode, sessionToken);
 
         // 啟動 yy_clicker.exe
-        wchar_t exeDir[MAX_PATH];
-        GetExeDir(exeDir, MAX_PATH);
-
         wchar_t clickerPath[MAX_PATH];
         wsprintfW(clickerPath, L"%s\\yy_clicker.exe", exeDir);
 
@@ -502,62 +679,46 @@ static DWORD WINAPI VerifyThread(LPVOID lpParam) {
         bool offlineOk = false;
 
         if (hFile != INVALID_HANDLE_VALUE) {
-            char buf[4096] = {};
+            char buf[8192] = {};
             DWORD br;
             ReadFile(hFile, buf, sizeof(buf) - 1, &br, NULL);
             CloseHandle(hFile);
 
-            // 解析 hwid_hash 和 machine_code
-            char* p1 = strstr(buf, "\"hwid_hash\"");
-            char* p2 = strstr(buf, "\"machine_code\"");
-            char* p3 = strstr(buf, "\"key\"");
+            // 解析欄位
+            char storedKey[256] = {};
+            char storedHash[128] = {};
+            char storedMC[128] = {};
 
-            if (p1 && p2 && p3) {
-                // 解析 stored key
-                char storedKey[256] = {};
-                char* vk = strchr(p3 + 5, '"'); if (vk) { vk++;
-                char* ek = strchr(vk, '"'); if (ek) {
-                    int lk = (int)(ek - vk); if (lk < 256) {
-                        for (int i = 0; i < lk; i++) storedKey[i] = vk[i];
-                        storedKey[lk] = '\0';
-                    }
-                }}
+            ParseJsonString(buf, "key", storedKey, 256);
+            ParseJsonString(buf, "hwid_hash", storedHash, 128);
+            ParseJsonString(buf, "machine_code", storedMC, 128);
 
-                // 解析 stored hash
-                char storedHash[128] = {};
-                char* v1 = strchr(p1 + 11, '"'); if (v1) { v1++;
-                char* e1 = strchr(v1, '"'); if (e1) {
-                    int l1 = (int)(e1 - v1); if (l1 < 128) {
-                        for (int i = 0; i < l1; i++) storedHash[i] = v1[i];
-                        storedHash[l1] = '\0';
-                    }
-                }}
+            // 驗證金鑰匹配
+            if (strcmp(storedKey, keyUtf8) == 0) {
+                // 嘗試增強型 HWID
+                char rawHwid[512] = {};
+                GetEnhancedRawHWID(rawHwid, 512);
+                char currentHash[128] = {};
+                ComputeEncryptedHWID(rawHwid, currentHash);
 
-                // 解析 stored machine code
-                char storedMC[128] = {};
-                char* v2 = strchr(p2 + 14, '"'); if (v2) { v2++;
-                char* e2 = strchr(v2, '"'); if (e2) {
-                    int l2 = (int)(e2 - v2); if (l2 < 128) {
-                        for (int i = 0; i < l2; i++) storedMC[i] = v2[i];
-                        storedMC[l2] = '\0';
-                    }
-                }}
+                bool hwidMatch = (strcmp(storedHash, currentHash) == 0);
 
-                // 驗證金鑰匹配
-                if (strcmp(storedKey, keyUtf8) == 0) {
-                    // 驗證 HWID
-                    char rawHwid[512] = {};
-                    GetRawHWID(rawHwid, 512);
-                    char currentHash[128] = {};
-                    ComputeEncryptedHWID(rawHwid, currentHash);
-
-                    if (strcmp(storedHash, currentHash) == 0) {
+                // 向後相容：嘗試舊版 HWID
+                if (!hwidMatch) {
+                    char legacyHwid[512] = {};
+                    GetLegacyRawHWID(legacyHwid, 512);
+                    char legacyHash[128] = {};
+                    ComputeEncryptedHWID(legacyHwid, legacyHash);
+                    hwidMatch = (strcmp(storedHash, legacyHash) == 0);
+                    if (hwidMatch) {
                         char expectedMC[128] = {};
-                        ComputeMachineCode(keyUtf8, currentHash, expectedMC);
-                        if (strcmp(storedMC, expectedMC) == 0) {
-                            offlineOk = true;
-                        }
+                        ComputeMachineCode(keyUtf8, legacyHash, expectedMC);
+                        if (strcmp(storedMC, expectedMC) == 0) offlineOk = true;
                     }
+                } else {
+                    char expectedMC[128] = {};
+                    ComputeMachineCode(keyUtf8, currentHash, expectedMC);
+                    if (strcmp(storedMC, expectedMC) == 0) offlineOk = true;
                 }
             }
         }
@@ -809,6 +970,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmd, int nShow) {
     (void)lpCmd;
     (void)nShow;
 
+    // 初始化 COM（用於 CoCreateGuid）
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_STANDARD_CLASSES;
@@ -840,7 +1004,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmd, int nShow) {
         posX, posY, WIN_W, WIN_H,
         NULL, NULL, hInst, NULL);
 
-    if (!hwnd) return 1;
+    if (!hwnd) { CoUninitialize(); return 1; }
 
     if (hEditKey) {
         g_origEditProc = (WNDPROC)SetWindowLongPtrW(hEditKey, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
@@ -857,5 +1021,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmd, int nShow) {
         }
     }
 
+    CoUninitialize();
     return (int)msg.wParam;
 }
