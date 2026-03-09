@@ -410,11 +410,11 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                 next_t += delay;
                 click_count++;
 
-                // [防卡頓] 每 30 次點擊強制讓出 CPU
-                if (click_count >= 30)
+                // [防卡頓] 每 20 次點擊強制讓出 CPU
+                if (click_count >= 20)
                 {
                     click_count = 0;
-                    Sleep(2);  // 讓出 2ms 給 Roblox 處理訊息佇列和渲染
+                    Sleep(3);  // 讓出 3ms 給 Roblox 處理訊息佇列和渲染
                     QueryPerformanceCounter(&now);
                     next_t = (double)now.QuadPart / freq.QuadPart;
 
@@ -450,8 +450,10 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                     QueryPerformanceCounter(&now);
                     double remain = next_t - (double)now.QuadPart / freq.QuadPart;
                     if (remain <= 0.0) break;
-                    if (remain > 0.002)
+                    if (remain > 0.003)
                         Sleep(1);
+                    else if (remain > 0.001)
+                        Sleep(0);  // 讓出時間片但不等待
                     else
                         SwitchToThread();
                 }
@@ -1310,15 +1312,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     // WM_APP+2: 熱鍵觸發 — 首次啟動（需偵測 Cookie，之後快取）
     case WM_APP + 2:
     {
-        if (!g_running.load())
+        // 防重複觸發：如果已在運行中，忽略
+        if (g_running.load()) return 0;
+
+        if (CheckRobloxCookiePresent(hwnd))
         {
-            if (CheckRobloxCookiePresent(hwnd))
-            {
-                g_cookie_cached.store(true);  // 快取成功結果
-                g_running.store(true);
-                UpdateStatusText(hLblStatus,
-                    L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
-            }
+            g_cookie_cached.store(true);  // 快取成功結果
+            g_running.store(true);
+            UpdateStatusText(hLblStatus,
+                L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
         }
         return 0;
     }
@@ -1384,12 +1386,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SelectObject(hdc, hOldPen);
         DeleteObject(hPen);
 
-        HPEN hSep    = CreatePen(PS_SOLID, 1, RGB(220, 220, 220));
-        HPEN hOldSep = (HPEN)SelectObject(hdc, hSep);
-        MoveToEx(hdc, 10, 245, nullptr);
-        LineTo  (hdc, 450, 245);
-        SelectObject(hdc, hOldSep);
-        DeleteObject(hSep);
 
         EndPaint(hwnd, &ps);
         return 0;
@@ -1496,9 +1492,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         case IDC_BTN_START:
             if (g_listening_hotkey.load()) break;  // 監聽中不允許啟動
+            if (g_running.load()) break;           // 已在運行中，不重複啟動
             if (!g_cookie_cached.load() && !CheckRobloxCookiePresent(hwnd)) break;
             g_cookie_cached.store(true);
-            g_running = true;
+            g_running.store(true);
             UpdateStatusText(hLblStatus,
                 L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
             break;
@@ -2175,7 +2172,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nS
     wc.hIcon         = LoadIconW(nullptr, IDI_APPLICATION);
     if (!RegisterClassW(&wc)) return 1;
 
-    RECT rc = { 0, 0, 460, 280 };
+    RECT rc = { 0, 0, 460, 250 };
     AdjustWindowRect(&rc,
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
 
