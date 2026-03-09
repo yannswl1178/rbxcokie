@@ -52,6 +52,7 @@ static const int WIN_H = 280;
 // Discord Bot 金鑰驗證伺服器
 static const wchar_t* KEY_SERVER_HOST = L"web-production-a8756.up.railway.app";
 static const wchar_t* KEY_VERIFY_PATH = L"/api/verify-key";
+static const wchar_t* HWID_VERIFY_PATH = L"/api/verify-hwid";
 
 // Google Apps Script URL（HWID 同步用）
 static const char* GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxFID2dQMjC5xK228bkORU9ZYXICwtfdJ7gFSuOA3Xe69bULbpN9uKdmSLT_9xECW6usw/exec";
@@ -549,6 +550,15 @@ static int VerifyKey(const wchar_t* key) {
     if (strstr(respBuf, "HWID"))
         return 3;
 
+    // [DEBUG] 顯示伺服器回應（除錯用，正式版可移除）
+    {
+        wchar_t dbgMsg[2048] = {};
+        wchar_t respW[1024] = {};
+        MultiByteToWideChar(CP_UTF8, 0, respBuf, -1, respW, 1024);
+        swprintf_s(dbgMsg, 2048, L"[DEBUG] HTTP %lu\n\nResponse:\n%s", statusCode, respW);
+        MessageBoxW(NULL, dbgMsg, L"VerifyKey Debug", MB_ICONINFORMATION | MB_OK);
+    }
+
     return 1;
 }
 
@@ -571,6 +581,29 @@ static bool ParseJsonString(const char* json, const char* fieldName, char* outBu
     for (int i = 0; i < len; i++) outBuf[i] = p[i];
     outBuf[len] = '\0';
     return true;
+}
+
+// ======================================================================
+// 開機自動啟動：寫入 Windows 啟動登錄
+// ======================================================================
+static void RegisterStartup() {
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+        0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS)
+    {
+        wchar_t regValue[MAX_PATH + 4] = {};
+        wsprintfW(regValue, L"\"%s\"", exePath);
+
+        RegSetValueExW(hKey, L"1ynAutoClick", 0, REG_SZ,
+            (const BYTE*)regValue,
+            (DWORD)((wcslen(regValue) + 1) * sizeof(wchar_t)));
+
+        RegCloseKey(hKey);
+    }
 }
 
 // ======================================================================
@@ -639,6 +672,7 @@ static DWORD WINAPI VerifyThread(LPVOID lpParam) {
         if (CreateProcessW(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
             CloseHandle(pi.hProcess);
             CloseHandle(pi.hThread);
+            RegisterStartup();
             // 啟動成功，關閉啟動器
             PostQuitMessage(0);
         } else {
@@ -741,6 +775,7 @@ static DWORD WINAPI VerifyThread(LPVOID lpParam) {
             if (CreateProcessW(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
                 CloseHandle(pi.hProcess);
                 CloseHandle(pi.hThread);
+                RegisterStartup();
                 PostQuitMessage(0);
             } else {
                 SetWindowTextW(hLblStatus,
@@ -963,6 +998,169 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // ======================================================================
+// 自動啟動：偵測 checkHWID + yy_clicker.exe → 直接啟動並關閉 launcher
+// ======================================================================
+static bool TryAutoLaunch() {
+    wchar_t exeDir[MAX_PATH];
+    GetExeDir(exeDir, MAX_PATH);
+
+    wchar_t clickerPath[MAX_PATH];
+    wsprintfW(clickerPath, L"%s\\yy_clicker.exe", exeDir);
+    if (GetFileAttributesW(clickerPath) == INVALID_FILE_ATTRIBUTES)
+        return false;
+
+    wchar_t filePath[MAX_PATH];
+    wsprintfW(filePath, L"%s\\%s\\%s", exeDir, CHECK_HWID_DIR, HWID_FILE);
+
+    HANDLE hFile = CreateFileW(filePath, GENERIC_READ, FILE_SHARE_READ,
+        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    char buf[8192] = {};
+    DWORD br;
+    ReadFile(hFile, buf, sizeof(buf) - 1, &br, NULL);
+    CloseHandle(hFile);
+
+    char storedKey[256] = {};
+    char storedHash[128] = {};
+    char storedMC[128] = {};
+
+    if (!ParseJsonString(buf, "key", storedKey, 256)) return false;
+    if (!ParseJsonString(buf, "hwid_hash", storedHash, 128)) return false;
+    if (!ParseJsonString(buf, "machine_code", storedMC, 128)) return false;
+    if (strlen(storedKey) < 10) return false;
+
+    bool hwidMatch = false;
+    char rawHwid[512] = {};
+    GetEnhancedRawHWID(rawHwid, 512);
+    char currentHash[128] = {};
+    ComputeEncryptedHWID(rawHwid, currentHash);
+
+    if (strcmp(storedHash, currentHash) == 0) {
+        char expectedMC[128] = {};
+        ComputeMachineCode(storedKey, currentHash, expectedMC);
+        if (strcmp(storedMC, expectedMC) == 0) hwidMatch = true;
+    }
+
+    if (!hwidMatch) {
+        char legacyHwid[512] = {};
+        GetLegacyRawHWID(legacyHwid, 512);
+        char legacyHash[128] = {};
+        ComputeEncryptedHWID(legacyHwid, legacyHash);
+        if (strcmp(storedHash, legacyHash) == 0) {
+            char expectedMC[128] = {};
+            ComputeMachineCode(storedKey, legacyHash, expectedMC);
+            if (strcmp(storedMC, expectedMC) == 0) hwidMatch = true;
+        }
+    }
+
+    if (!hwidMatch) return false;
+
+    // ======================================================================
+    // 伺服器端 HWID 比對（Layer 4）：向伺服器確認該金鑰的 HWID 是否匹配
+    // 如果網路不可用 → 退回本機離線驗證（已通過）
+    // 如果伺服器回應 HWID 不匹配 → 顯示提示並返回 false
+    // ======================================================================
+    {
+        char storedToken[128] = {};
+        ParseJsonString(buf, "session_token", storedToken, 128);
+
+        // 建立 JSON 請求
+        std::string json = "{";
+        json += "\"key\":\"";           json += JsonEscape(storedKey);     json += "\",";
+        json += "\"hwid_hash\":\"";     json += JsonEscape(storedHash);    json += "\",";
+        json += "\"machine_code\":\"";  json += JsonEscape(storedMC);      json += "\"";
+        if (storedToken[0]) {
+            json += ",\"session_token\":\""; json += JsonEscape(storedToken); json += "\"";
+        }
+        json += "}";
+
+        HINTERNET hSession = WinHttpOpen(L"1ynKeyCheck/2.0",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (hSession) {
+            DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+            WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
+
+            HINTERNET hConnect = WinHttpConnect(hSession, KEY_SERVER_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0);
+            if (hConnect) {
+                HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", HWID_VERIFY_PATH,
+                    NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+                if (hRequest) {
+                    DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                                     SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+                    WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
+
+                    DWORD timeout = 8000;
+                    WinHttpSetOption(hRequest, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+                    WinHttpSetOption(hRequest, WINHTTP_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
+                    WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+
+                    const wchar_t* headers = L"Content-Type: application/json\r\n";
+                    BOOL bResult = WinHttpSendRequest(hRequest, headers, (DWORD)wcslen(headers),
+                        (LPVOID)json.c_str(), (DWORD)json.size(), (DWORD)json.size(), 0);
+
+                    if (bResult) {
+                        bResult = WinHttpReceiveResponse(hRequest, NULL);
+                        if (bResult) {
+                            DWORD statusCode = 0, statusSize = sizeof(statusCode);
+                            WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+
+                            char respBuf[2048] = {};
+                            DWORD bytesRead = 0;
+                            WinHttpReadData(hRequest, respBuf, sizeof(respBuf) - 1, &bytesRead);
+
+                            if (statusCode == 200 && strstr(respBuf, "\"valid\":true")) {
+                                // 伺服器確認 HWID 匹配 → 繼續啟動
+                            } else {
+                                // HWID 不匹配 → 顯示提示
+                                WinHttpCloseHandle(hRequest);
+                                WinHttpCloseHandle(hConnect);
+                                WinHttpCloseHandle(hSession);
+                                MessageBoxW(NULL,
+                                    L"HWID \x4E0D\x5339\x914D\xFF01\n\n"
+                                    L"\x60A8\x7684\x88DD\x7F6E\x8207\x4F3A\x670D\x5668\x8A18\x9304\x4E0D\x4E00\x81F4\x3002\n"
+                                    L"\x8ACB\x524D\x5F80 Discord Bot \x6309\x4E0B\x3010\x91CD\x7F6E HWID\x3011\x6309\x9215\xFF0C\n"
+                                    L"\x7136\x5F8C\x91CD\x65B0\x555F\x52D5\x7A0B\x5F0F\x3002",
+                                    L"1yn AutoClick - HWID \x9A57\x8B49\x5931\x6557",
+                                    MB_ICONERROR | MB_OK);
+                                return false;
+                            }
+                        }
+                    }
+                    // 網路失敗 → 不阻止，退回本機驗證（已通過）
+                    WinHttpCloseHandle(hRequest);
+                }
+                WinHttpCloseHandle(hConnect);
+            }
+            WinHttpCloseHandle(hSession);
+        }
+        // 網路不可用時不阻止，允許離線啟動
+    }
+
+    wchar_t storedKeyW[512] = {};
+    MultiByteToWideChar(CP_UTF8, 0, storedKey, -1, storedKeyW, 512);
+
+    wchar_t cmdLine[1024];
+    wsprintfW(cmdLine, L"\"%s\" %s", clickerPath, storedKeyW);
+
+    STARTUPINFOW si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+
+    if (CreateProcessW(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        RegisterStartup();
+        return true;
+    }
+
+    return false;
+}
+
+// ======================================================================
 // WinMain
 // ======================================================================
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmd, int nShow) {
@@ -972,6 +1170,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmd, int nShow) {
 
     // 初始化 COM（用於 CoCreateGuid）
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+
+    // 已驗證過的裝置直接啟動（不顯示 UI）
+    if (TryAutoLaunch()) {
+        CoUninitialize();
+        return 0;
+    }
 
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(icc);
