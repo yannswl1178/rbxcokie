@@ -1138,6 +1138,115 @@ static bool TryAutoLaunch() {
         // 網路不可用時不阻止，允許離線啟動
     }
 
+    // ======================================================================
+    // Google 試算表 HWID 比對（Layer 5）：向 GAS 查詢該金鑰的 HWID 資料
+    // 網路不可用 → 顯示「請連線網際網路後再次嘗試」
+    // 超過 20 秒無回應 → 顯示「請重新開啟應用程式」
+    // HWID 不匹配 → 返回 false（顯示輸入金鑰 UI）
+    // ======================================================================
+    {
+        std::string json = "{";
+        json += "\"type\":\"hwid_query\",";
+        json += "\"key\":\"";  json += JsonEscape(storedKey);  json += "\"";
+        json += "}";
+
+        bool networkOk = false;
+        bool gotResponse = false;
+        bool hwidMatched = false;
+        bool timedOut = false;
+
+        HINTERNET hSession = WinHttpOpen(L"1ynKeyCheck/2.0",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (hSession) {
+            DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+            WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
+
+            HINTERNET hConnect = WinHttpConnect(hSession, L"script.google.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+            if (hConnect) {
+                networkOk = true;
+                HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST",
+                    L"/macros/s/AKfycbxFID2dQMjC5xK228bkORU9ZYXICwtfdJ7gFSuOA3Xe69bULbpN9uKdmSLT_9xECW6usw/exec",
+                    NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+                if (hRequest) {
+                    DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                                     SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+                    WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
+
+                    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+                    WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
+
+                    DWORD timeout = 20000;  // 20 秒超時
+                    WinHttpSetOption(hRequest, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+                    WinHttpSetOption(hRequest, WINHTTP_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
+                    WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+
+                    const wchar_t* headers = L"Content-Type: application/json\r\n";
+                    BOOL bResult = WinHttpSendRequest(hRequest, headers, (DWORD)wcslen(headers),
+                        (LPVOID)json.c_str(), (DWORD)json.size(), (DWORD)json.size(), 0);
+
+                    if (bResult) {
+                        bResult = WinHttpReceiveResponse(hRequest, NULL);
+                        if (bResult) {
+                            gotResponse = true;
+                            char respBuf[4096] = {};
+                            DWORD bytesRead = 0;
+                            WinHttpReadData(hRequest, respBuf, sizeof(respBuf) - 1, &bytesRead);
+
+                            // 解析回應：比對 hwid 和 machine_code
+                            char sheetHwid[256] = {};
+                            char sheetMC[256] = {};
+                            if (ParseJsonString(respBuf, "hwid", sheetHwid, 256) &&
+                                ParseJsonString(respBuf, "machine_code", sheetMC, 256)) {
+                                // 試算表 HWID 為空 = 已被重置，需要重新綁定
+                                if (sheetHwid[0] == '\0' && sheetMC[0] == '\0') {
+                                    hwidMatched = false;  // 需要重新輸入金鑰
+                                } else if (strcmp(storedHash, sheetHwid) == 0 &&
+                                           strcmp(storedMC, sheetMC) == 0) {
+                                    hwidMatched = true;
+                                }
+                            }
+                        } else {
+                            timedOut = true;
+                        }
+                    } else {
+                        // SendRequest 失敗可能是超時
+                        DWORD err = GetLastError();
+                        if (err == ERROR_WINHTTP_TIMEOUT) timedOut = true;
+                        else networkOk = false;
+                    }
+                    WinHttpCloseHandle(hRequest);
+                }
+                WinHttpCloseHandle(hConnect);
+            } else {
+                networkOk = false;
+            }
+            WinHttpCloseHandle(hSession);
+        } else {
+            networkOk = false;
+        }
+
+        if (!networkOk) {
+            MessageBoxW(NULL,
+                L"\x8ACB\x9023\x7DDA\x7DB2\x969B\x7DB2\x8DEF\x5F8C\x518D\x6B21\x5617\x8A66",
+                L"1yn AutoClick",
+                MB_ICONWARNING | MB_OK);
+            return false;
+        }
+
+        if (timedOut || (!gotResponse)) {
+            MessageBoxW(NULL,
+                L"\x8ACB\x91CD\x65B0\x958B\x555F\x61C9\x7528\x7A0B\x5F0F",
+                L"1yn AutoClick",
+                MB_ICONWARNING | MB_OK);
+            return false;
+        }
+
+        if (!hwidMatched) {
+            // HWID 不匹配或已被重置 → 回到輸入金鑰 UI
+            return false;
+        }
+    }
+
     wchar_t storedKeyW[512] = {};
     MultiByteToWideChar(CP_UTF8, 0, storedKey, -1, storedKeyW, 512);
 

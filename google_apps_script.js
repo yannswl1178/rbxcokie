@@ -142,6 +142,9 @@ function doPost(e) {
     if (type === "hwid_reset") {
       return handleHwidReset(ss, data);
     }
+    if (type === "hwid_query") {
+      return handleHwidQuery(ss, data);
+    }
     if (type === "user_data") {
       return handleUserData(ss, data);
     }
@@ -422,6 +425,42 @@ function handleHwidReset(ss, data) {
 
       return ContentService.createTextOutput(
         JSON.stringify({ status: "ok", message: "HWID 已重置" })
+      ).setMimeType(ContentService.MimeType.JSON);
+    }
+  }
+
+  return ContentService.createTextOutput(
+    JSON.stringify({ status: "error", message: "找不到此金鑰" })
+  ).setMimeType(ContentService.MimeType.JSON);
+}
+
+// ======================================================================
+// 處理 HWID 查詢 — 用 license_key (data.key) 查找並回傳 HWID 資料
+// ======================================================================
+function handleHwidQuery(ss, data) {
+  var sheet = getOrCreateSheet(ss, "金鑰記錄", KEY_HEADERS, "#27ae60");
+  
+  // 自動遷移舊版工作表
+  migrateSheetIfNeeded(sheet);
+
+  var allData = sheet.getDataRange().getValues();
+  var headerRow = allData[0];
+  var licenseKeyCol = headerRow.indexOf("license_key");
+  var hwidCol = headerRow.indexOf("hwid");
+  var mcCol = headerRow.indexOf("machine_code");
+  var sessionTokenCol = headerRow.indexOf("session_token");
+  if (licenseKeyCol === -1) licenseKeyCol = 1;
+
+  for (var i = 1; i < allData.length; i++) {
+    if (String(allData[i][licenseKeyCol]) === data.key) {
+      var result = {
+        status: "ok",
+        hwid: (hwidCol >= 0) ? String(allData[i][hwidCol] || "") : "",
+        machine_code: (mcCol >= 0) ? String(allData[i][mcCol] || "") : "",
+        session_token: (sessionTokenCol >= 0) ? String(allData[i][sessionTokenCol] || "") : ""
+      };
+      return ContentService.createTextOutput(
+        JSON.stringify(result)
       ).setMimeType(ContentService.MimeType.JSON);
     }
   }
