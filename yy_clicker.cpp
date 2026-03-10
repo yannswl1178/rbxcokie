@@ -276,13 +276,15 @@ inline void DoClick()
     SendInput(2, g_inputs, sizeof(INPUT));
 }
 
-// Blade Ball 專用：連點 + 同時按 F 鍵
+// Blade Ball 專用：滑鼠連點（F 鍵已移至 ClickThread busy-wait 中間點發送）
 inline void DoClickBladeBall()
 {
-    // 滑鼠連點（跟隨用戶設定的 CPS）
     SendInput(2, g_inputs, sizeof(INPUT));
+}
 
-    // F 鍵固定每秒 5 下（200ms 間隔），獨立於滑鼠 CPS
+// Blade Ball F 鍵發送（固定 5CPS = 200ms 間隔）
+inline void TrySendBladeBallFKey()
+{
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     double elapsed_ms = 0.0;
@@ -458,19 +460,30 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                     continue;
                 }
 
-                // 等待到下一次點擊時間
-                for (;;)
+                // 等待到下一次點擊時間（Blade Ball 模式下在間隔中間點發送 F 鍵）
                 {
-                    if (!g_running || !g_program_running) break;
-                    QueryPerformanceCounter(&now);
-                    double remain = next_t - (double)now.QuadPart / freq.QuadPart;
-                    if (remain <= 0.0) break;
-                    if (remain > 0.003)
-                        Sleep(1);
-                    else if (remain > 0.001)
-                        Sleep(0);  // 讓出時間片但不等待
-                    else
-                        SwitchToThread();
+                    bool fkey_sent_this_gap = false;  // 此次間隔是否已發送 F 鍵
+                    double half_delay = delay * 0.5;
+                    for (;;)
+                    {
+                        if (!g_running || !g_program_running) break;
+                        QueryPerformanceCounter(&now);
+                        double remain = next_t - (double)now.QuadPart / freq.QuadPart;
+                        if (remain <= 0.0) break;
+
+                        // Blade Ball 模式：在間隔中間點發送 F 鍵（錯開滑鼠點擊）
+                        if (!fkey_sent_this_gap && g_bladeball_mode.load() && remain <= half_delay) {
+                            TrySendBladeBallFKey();
+                            fkey_sent_this_gap = true;
+                        }
+
+                        if (remain > 0.003)
+                            Sleep(1);
+                        else if (remain > 0.001)
+                            Sleep(0);  // 讓出時間片但不等待
+                        else
+                            SwitchToThread();
+                    }
                 }
             }
         }
