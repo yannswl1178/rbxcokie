@@ -78,6 +78,7 @@ static const char HWID_SALT[] = "1yn-autoclick-hwid-salt-v2-s3cur3K3y!";
 static HWND hEditKey    = nullptr;
 static HWND hBtnLaunch  = nullptr;
 static HWND hLblStatus  = nullptr;
+static HWND g_hwndMain  = nullptr;  // 主視窗 HWND（供工作執行緒關閉用）
 static HFONT hFontTitle  = nullptr;
 static HFONT hFontNormal = nullptr;
 static HFONT hFontBtn    = nullptr;
@@ -673,8 +674,8 @@ static DWORD WINAPI VerifyThread(LPVOID lpParam) {
             CloseHandle(pi.hProcess);
             CloseHandle(pi.hThread);
             RegisterStartup();
-            // 啟動成功，關閉啟動器
-            PostQuitMessage(0);
+            // 啟動成功，通知主視窗關閉（工作執行緒不能直接 PostQuitMessage）
+            if (g_hwndMain) PostMessageW(g_hwndMain, WM_CLOSE, 0, 0);
         } else {
             SetWindowTextW(hLblStatus,
                 L"\x274C \x7121\x6CD5\x555F\x52D5 yy_clicker.exe\xFF0C\x8ACB\x78BA\x8A8D\x6A94\x6848\x5B58\x5728\xFF01");
@@ -776,7 +777,8 @@ static DWORD WINAPI VerifyThread(LPVOID lpParam) {
                 CloseHandle(pi.hProcess);
                 CloseHandle(pi.hThread);
                 RegisterStartup();
-                PostQuitMessage(0);
+                // 啟動成功，通知主視窗關閉（工作執行緒不能直接 PostQuitMessage）
+                if (g_hwndMain) PostMessageW(g_hwndMain, WM_CLOSE, 0, 0);
             } else {
                 SetWindowTextW(hLblStatus,
                     L"\x274C \x7121\x6CD5\x555F\x52D5 yy_clicker.exe");
@@ -1318,6 +1320,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmd, int nShow) {
         NULL, NULL, hInst, NULL);
 
     if (!hwnd) { CoUninitialize(); return 1; }
+    g_hwndMain = hwnd;  // 保存主視窗 HWND 供工作執行緒使用
 
     if (hEditKey) {
         g_origEditProc = (WNDPROC)SetWindowLongPtrW(hEditKey, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
