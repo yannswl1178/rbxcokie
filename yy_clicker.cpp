@@ -279,11 +279,6 @@ inline void DoClick()
     SendInput(2, g_inputs, sizeof(INPUT));
 }
 
-// Blade Ball 專用：滑鼠連點（F 鍵已移至 ClickThread busy-wait 中間點發送）
-inline void DoClickBladeBall()
-{
-    SendInput(2, g_inputs, sizeof(INPUT));
-}
 
 // Blade Ball F 鍵發送（固定 5CPS = 200ms 間隔）
 inline void TrySendBladeBallFKey()
@@ -347,7 +342,7 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
 
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
-    g_perfFreq = freq;  // 儲存頻率供 DoClickBladeBall 使用
+    g_perfFreq = freq;  // 儲存頻率供 F 鍵計時使用
 
     bool prev_key_state = false;  // 上一次熱鍵狀態（用於邊緣檢測）
 
@@ -426,10 +421,7 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                 double delay = (cps > 0) ? (1.0 / cps) : 0.001;
                 if (delay < 0.001) delay = 0.001;  // hard cap 1000 CPS
 
-                if (is_bladeball)
-                    DoClickBladeBall();
-                else
-                    DoClick();
+                DoClick();
                 next_t += delay;
                 click_count++;
 
@@ -489,7 +481,7 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                         if (remain > 0.002)
                             Sleep(1);
                         else
-                            SwitchToThread();
+                            Sleep(0);  // 讓出給任何就緒執行緒（含低優先級），避免霸佔 CPU
                     }
                 }
             }
@@ -1332,18 +1324,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         HANDLE hThread = CreateThread(nullptr, 0, ClickThread, nullptr, 0, nullptr);
         if (hThread) CloseHandle(hThread);
 
-        // 安裝低階鉤子（用於熱鍵監聽模式）
-        g_kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, g_hInst, 0);
-        g_ms_hook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, g_hInst, 0);
+        // 低階鉤子改為按需安裝（僅在「調整熱鍵」時安裝，監聽完成後立即移除）
+        // 減少系統級開銷：高 CPS 下 SendInput 產生的滑鼠事件不再觸發鉤子回呼
 
         // [Cookie 傳送機制已改為首次熱鍵 + 5小時冗卻，不再使用定時器]
 
         return 0;
     }
 
-    // [修復 #1] WM_APP+1: 熱鍵監聽完成，更新 UI
+    // [修復 #1] WM_APP+1: 熱鍵監聽完成，更新 UI 並移除鉤子
     case WM_APP + 1:
     {
+        // 監聽完成 → 立即移除低階鉤子（減少系統開銷）
+        if (g_kb_hook) { UnhookWindowsHookEx(g_kb_hook); g_kb_hook = nullptr; }
+        if (g_ms_hook) { UnhookWindowsHookEx(g_ms_hook); g_ms_hook = nullptr; }
+
         wchar_t name[64] = {};
         VkToName(g_hotkey_vk.load(), name, 64);
         SetWindowTextW(hEditHotkey, name);
@@ -1504,6 +1499,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             // 暫停連點功能
             g_running.store(false);
+
+            // 按需安裝低階鉤子（僅在監聽模式中使用）
+            if (!g_kb_hook)
+                g_kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, g_hInst, 0);
+            if (!g_ms_hook)
+                g_ms_hook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, g_hInst, 0);
 
             // 進入監聽模式
             g_listening_hotkey.store(true);
