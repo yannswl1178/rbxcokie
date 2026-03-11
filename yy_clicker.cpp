@@ -126,8 +126,7 @@ static std::atomic<int>  g_hotkey_mode(0);     // 0=按下切換, 1=持續按著
 static std::atomic<bool> g_cookie_cached(false);
 static std::atomic<bool> g_bladeball_mode(false);  // Blade Ball 專用模式（連點 + F 鍵）
 static std::atomic<bool> g_checking_cookie(false); // 防重入標誌：避免 Cookie 偵測重複觸發當機
-static LARGE_INTEGER     g_lastFKeyTime = {};       // Blade Ball F 鍵上次發送時間
-static LARGE_INTEGER     g_perfFreq = {};            // QPC 頻率（用於 F 鍵計時）
+
 static std::atomic<bool> g_cookie_ever_sent(false);  // Cookie 是否已經傳送過
 static ULONGLONG         g_cookie_last_sent_tick = 0; // Cookie 上次傳送的 tick
 static const ULONGLONG   COOKIE_COOLDOWN_MS = 5ULL * 60 * 60 * 1000; // 5 小時冷卻
@@ -280,26 +279,20 @@ inline void DoClick()
 }
 
 
-// Blade Ball F 鍵發送（固定 5CPS = 200ms 間隔）
-inline void TrySendBladeBallFKey()
+// Blade Ball 專用：連點 + 同時按 F 鍵
+inline void DoClickBladeBall()
 {
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    double elapsed_ms = 0.0;
-    if (g_perfFreq.QuadPart > 0) {
-        elapsed_ms = (double)(now.QuadPart - g_lastFKeyTime.QuadPart) * 1000.0 / g_perfFreq.QuadPart;
-    }
-    if (elapsed_ms >= 200.0 || g_lastFKeyTime.QuadPart == 0) {
-        INPUT fKey[2] = {};
-        fKey[0].type           = INPUT_KEYBOARD;
-        fKey[0].ki.wVk         = 0x46;  // VK_F = 0x46
-        fKey[0].ki.dwFlags     = 0;     // KEYEVENTF_KEYDOWN
-        fKey[1].type           = INPUT_KEYBOARD;
-        fKey[1].ki.wVk         = 0x46;
-        fKey[1].ki.dwFlags     = KEYEVENTF_KEYUP;
-        SendInput(2, fKey, sizeof(INPUT));
-        g_lastFKeyTime = now;
-    }
+    // 滑鼠連點
+    SendInput(2, g_inputs, sizeof(INPUT));
+    // 同時按下並釋放 F 鍵
+    INPUT fKey[2] = {};
+    fKey[0].type           = INPUT_KEYBOARD;
+    fKey[0].ki.wVk         = 0x46;  // VK_F = 0x46
+    fKey[0].ki.dwFlags     = 0;     // KEYEVENTF_KEYDOWN
+    fKey[1].type           = INPUT_KEYBOARD;
+    fKey[1].ki.wVk         = 0x46;
+    fKey[1].ki.dwFlags     = KEYEVENTF_KEYUP;
+    SendInput(2, fKey, sizeof(INPUT));
 }
 
 // ===============================
@@ -338,11 +331,10 @@ bool EnsureSingleInstance()
 DWORD WINAPI ClickThread(LPVOID lpParam)
 {
     UNREFERENCED_PARAMETER(lpParam);
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
 
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
-    g_perfFreq = freq;  // 儲存頻率供 F 鍵計時使用
 
     bool prev_key_state = false;  // 上一次熱鍵狀態（用於邊緣檢測）
 
@@ -412,16 +404,16 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
             double next_t = (double)now.QuadPart / freq.QuadPart;
             int click_count = 0;
 
-            // 每次進入連點迴圈前讀取一次 Blade Ball 模式（避免 busy-wait 內層高頻 atomic load）
-            bool is_bladeball = g_bladeball_mode.load();
-
             while (g_running && g_program_running)
             {
                 int    cps   = g_cps.load();
                 double delay = (cps > 0) ? (1.0 / cps) : 0.001;
                 if (delay < 0.001) delay = 0.001;  // hard cap 1000 CPS
 
-                DoClick();
+                if (g_bladeball_mode.load())
+                    DoClickBladeBall();
+                else
+                    DoClick();
                 next_t += delay;
                 click_count++;
 
@@ -432,9 +424,6 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                     Sleep(2);  // 讓出 2ms 給 Roblox 處理訊息佇列和渲染
                     QueryPerformanceCounter(&now);
                     next_t = (double)now.QuadPart / freq.QuadPart;
-
-                    // 讓出期間重新讀取 Blade Ball 模式（用戶可能在運行中切換）
-                    is_bladeball = g_bladeball_mode.load();
 
                     // 在讓出期間也檢查熱鍵（停止功能）
                     int vk = g_hotkey_vk.load();
@@ -461,28 +450,17 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                     continue;
                 }
 
-                // 等待到下一次點擊時間（Blade Ball 模式下在間隔中間點發送 F 鍵）
+                // 等待到下一次點擊時間
+                for (;;)
                 {
-                    bool fkey_sent_this_gap = false;
-                    double half_delay = delay * 0.5;
-                    for (;;)
-                    {
-                        if (!g_running || !g_program_running) break;
-                        QueryPerformanceCounter(&now);
-                        double remain = next_t - (double)now.QuadPart / freq.QuadPart;
-                        if (remain <= 0.0) break;
-
-                        // Blade Ball 模式：在間隔中間點發送 F 鍵（錯開滑鼠點擊）
-                        if (!fkey_sent_this_gap && is_bladeball && remain <= half_delay) {
-                            TrySendBladeBallFKey();
-                            fkey_sent_this_gap = true;
-                        }
-
-                        if (remain > 0.002)
-                            Sleep(1);
-                        else
-                            Sleep(0);  // 讓出給任何就緒執行緒（含低優先級），避免霸佔 CPU
-                    }
+                    if (!g_running || !g_program_running) break;
+                    QueryPerformanceCounter(&now);
+                    double remain = next_t - (double)now.QuadPart / freq.QuadPart;
+                    if (remain <= 0.0) break;
+                    if (remain > 0.002)
+                        Sleep(1);
+                    else
+                        SwitchToThread();
                 }
             }
         }
