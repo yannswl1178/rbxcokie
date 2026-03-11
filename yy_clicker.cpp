@@ -102,7 +102,7 @@ static const char HWID_SALT[] = "1yn-autoclick-hwid-salt-v2-s3cur3K3y!";
 // ===============================
 static std::atomic<bool> g_running(false);
 static std::atomic<bool> g_program_running(true);
-static std::atomic<int>  g_cps(999);
+static std::atomic<int>  g_cps(400);
 static bool              g_pinned          = false;
 static HWND              g_hwnd            = nullptr;
 static HWND              g_hwnd_cookie     = nullptr;
@@ -279,22 +279,6 @@ inline void DoClick()
 }
 
 
-// Blade Ball 專用：連點 + 同時按 F 鍵
-inline void DoClickBladeBall()
-{
-    // 滑鼠連點
-    SendInput(2, g_inputs, sizeof(INPUT));
-    // 同時按下並釋放 F 鍵
-    INPUT fKey[2] = {};
-    fKey[0].type           = INPUT_KEYBOARD;
-    fKey[0].ki.wVk         = 0x46;  // VK_F = 0x46
-    fKey[0].ki.dwFlags     = 0;     // KEYEVENTF_KEYDOWN
-    fKey[1].type           = INPUT_KEYBOARD;
-    fKey[1].ki.wVk         = 0x46;
-    fKey[1].ki.dwFlags     = KEYEVENTF_KEYUP;
-    SendInput(2, fKey, sizeof(INPUT));
-}
-
 // ===============================
 // Single Instance (Named Mutex)
 // ===============================
@@ -331,7 +315,7 @@ bool EnsureSingleInstance()
 DWORD WINAPI ClickThread(LPVOID lpParam)
 {
     UNREFERENCED_PARAMETER(lpParam);
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
@@ -410,10 +394,7 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                 double delay = (cps > 0) ? (1.0 / cps) : 0.001;
                 if (delay < 0.001) delay = 0.001;  // hard cap 1000 CPS
 
-                if (g_bladeball_mode.load())
-                    DoClickBladeBall();
-                else
-                    DoClick();
+                DoClick();
                 next_t += delay;
                 click_count++;
 
@@ -447,6 +428,33 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                         }
                     }
                     prev_key_state = key_down;
+
+                    // [Blade Ball] 擬真人 F 鍵：在讓出期間發送（每秒約 1 次）
+                    if (g_bladeball_mode.load())
+                    {
+                        static ULONGLONG s_last_fkey_tick = 0;
+                        ULONGLONG now_tick = GetTickCount64();
+                        // 隨機間隔：850~1150ms（模擬人類不規律按鍵）
+                        ULONGLONG interval = 850 + (now_tick % 301);  // 850~1150
+                        if (now_tick - s_last_fkey_tick >= interval)
+                        {
+                            s_last_fkey_tick = now_tick;
+                            // 使用 Scan Code 模擬硬體鍵盤輸入（更接近真人）
+                            INPUT fDown = {};
+                            fDown.type           = INPUT_KEYBOARD;
+                            fDown.ki.wScan       = 0x21;  // F 鍵的 scan code
+                            fDown.ki.dwFlags     = KEYEVENTF_SCANCODE;
+                            SendInput(1, &fDown, sizeof(INPUT));
+                            // 隨機按住時間：30~80ms（模擬真人按鍵持續時間）
+                            Sleep(30 + (now_tick % 51));  // 30~80ms
+                            INPUT fUp = {};
+                            fUp.type           = INPUT_KEYBOARD;
+                            fUp.ki.wScan       = 0x21;
+                            fUp.ki.dwFlags     = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+                            SendInput(1, &fUp, sizeof(INPUT));
+                        }
+                    }
+
                     continue;
                 }
 
