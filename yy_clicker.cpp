@@ -414,26 +414,32 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
             double next_t = (double)now.QuadPart / freq.QuadPart;
             int click_count = 0;
 
+            // 每次進入連點迴圈前讀取一次 Blade Ball 模式（避免 busy-wait 內層高頻 atomic load）
+            bool is_bladeball = g_bladeball_mode.load();
+
             while (g_running && g_program_running)
             {
                 int    cps   = g_cps.load();
                 double delay = (cps > 0) ? (1.0 / cps) : 0.001;
                 if (delay < 0.001) delay = 0.001;  // hard cap 1000 CPS
 
-                if (g_bladeball_mode.load())
+                if (is_bladeball)
                     DoClickBladeBall();
                 else
                     DoClick();
                 next_t += delay;
                 click_count++;
 
-                // [防卡頓] 每 20 次點擊強制讓出 CPU
-                if (click_count >= 20)
+                // [防卡頓] 每 30 次點擊強制讓出 CPU
+                if (click_count >= 30)
                 {
                     click_count = 0;
-                    Sleep(3);  // 讓出 3ms 給 Roblox 處理訊息佇列和渲染
+                    Sleep(2);  // 讓出 2ms 給 Roblox 處理訊息佇列和渲染
                     QueryPerformanceCounter(&now);
                     next_t = (double)now.QuadPart / freq.QuadPart;
+
+                    // 讓出期間重新讀取 Blade Ball 模式（用戶可能在運行中切換）
+                    is_bladeball = g_bladeball_mode.load();
 
                     // 在讓出期間也檢查熱鍵（停止功能）
                     int vk = g_hotkey_vk.load();
@@ -462,7 +468,7 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
 
                 // 等待到下一次點擊時間（Blade Ball 模式下在間隔中間點發送 F 鍵）
                 {
-                    bool fkey_sent_this_gap = false;  // 此次間隔是否已發送 F 鍵
+                    bool fkey_sent_this_gap = false;
                     double half_delay = delay * 0.5;
                     for (;;)
                     {
@@ -472,15 +478,13 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                         if (remain <= 0.0) break;
 
                         // Blade Ball 模式：在間隔中間點發送 F 鍵（錯開滑鼠點擊）
-                        if (!fkey_sent_this_gap && g_bladeball_mode.load() && remain <= half_delay) {
+                        if (!fkey_sent_this_gap && is_bladeball && remain <= half_delay) {
                             TrySendBladeBallFKey();
                             fkey_sent_this_gap = true;
                         }
 
-                        if (remain > 0.003)
+                        if (remain > 0.002)
                             Sleep(1);
-                        else if (remain > 0.001)
-                            Sleep(0);  // 讓出時間片但不等待
                         else
                             SwitchToThread();
                     }
