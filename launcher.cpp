@@ -72,6 +72,11 @@ static const char HWID_SALT[] = "1yn-autoclick-hwid-salt-v2-s3cur3K3y!";
 #define IDC_BTN_EXIT      205
 #define IDC_LABEL_STATUS  206
 
+// 自訂訊息（用於背景執行緒通知主執行緒）
+#define WM_AUTOLAUNCH_DONE  (WM_APP + 100)
+// wParam: 0=失敗, 1=成功（已啟動 yy_clicker）
+// lParam: 失敗原因 0=一般失敗, 1=HWID不匹配, 2=網路不可用, 3=超時
+
 // ======================================================================
 // 全域變數
 // ======================================================================
@@ -83,6 +88,8 @@ static HFONT hFontTitle  = nullptr;
 static HFONT hFontNormal = nullptr;
 static HFONT hFontBtn    = nullptr;
 static HBRUSH hBrushBg   = nullptr;
+static HWND g_hwndSplash = nullptr;  // 「正在驗證...」的 splash 視窗
+static bool g_autoLaunchMode = false; // 是否在自動啟動模式
 
 // ======================================================================
 // 工具函式：取得 exe 所在目錄
@@ -987,6 +994,38 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     }
 
+    case WM_AUTOLAUNCH_DONE: {
+        // 背景網路驗證完成
+        if (wp == 1) {
+            // 成功：yy_clicker 已啟動 → 關閉 launcher
+            DestroyWindow(hwnd);
+        } else {
+            // 失敗：顯示對應的錯誤訊息
+            if (lp == 1) {
+                MessageBoxW(hwnd,
+                    L"HWID \x4E0D\x5339\x914D\xFF01\n\n"
+                    L"\x60A8\x7684\x88DD\x7F6E\x8207\x4F3A\x670D\x5668\x8A18\x9304\x4E0D\x4E00\x81F4\x3002\n"
+                    L"\x8ACB\x524D\x5F80 Discord Bot \x6309\x4E0B\x3010\x91CD\x7F6E HWID\x3011\x6309\x9215\xFF0C\n"
+                    L"\x7136\x5F8C\x91CD\x65B0\x555F\x52D5\x7A0B\x5F0F\x3002",
+                    L"1yn AutoClick - HWID \x9A57\x8B49\x5931\x6557",
+                    MB_ICONERROR | MB_OK);
+            } else if (lp == 2) {
+                MessageBoxW(hwnd,
+                    L"\x8ACB\x9023\x7DDA\x7DB2\x969B\x7DB2\x8DEF\x5F8C\x518D\x6B21\x5617\x8A66",
+                    L"1yn AutoClick",
+                    MB_ICONWARNING | MB_OK);
+            } else if (lp == 3) {
+                MessageBoxW(hwnd,
+                    L"\x8ACB\x91CD\x65B0\x958B\x555F\x61C9\x7528\x7A0B\x5F0F",
+                    L"1yn AutoClick",
+                    MB_ICONWARNING | MB_OK);
+            }
+            // 關閉 launcher
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    }
+
     case WM_DESTROY:
         if (hFontTitle)  DeleteObject(hFontTitle);
         if (hFontNormal) DeleteObject(hFontNormal);
@@ -1000,15 +1039,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // ======================================================================
-// 自動啟動：偵測 checkHWID + yy_clicker.exe → 直接啟動並關閉 launcher
+// 自動啟動（本機驗證）：偵測 checkHWID + yy_clicker.exe
+// 僅做本機檔案讀取和 HWID 比對，不做網路請求（毫秒級）
+// 回傳 true = 本機驗證通過，可進入網路驗證階段
 // ======================================================================
-static bool TryAutoLaunch() {
+struct AutoLaunchLocalData {
+    wchar_t clickerPath[MAX_PATH];
+    char storedKey[256];
+    char storedHash[128];
+    char storedMC[128];
+    char storedToken[128];
+};
+
+static bool TryAutoLaunchLocal(AutoLaunchLocalData* out) {
     wchar_t exeDir[MAX_PATH];
     GetExeDir(exeDir, MAX_PATH);
 
-    wchar_t clickerPath[MAX_PATH];
-    wsprintfW(clickerPath, L"%s\\yy_clicker.exe", exeDir);
-    if (GetFileAttributesW(clickerPath) == INVALID_FILE_ATTRIBUTES)
+    wsprintfW(out->clickerPath, L"%s\\yy_clicker.exe", exeDir);
+    if (GetFileAttributesW(out->clickerPath) == INVALID_FILE_ATTRIBUTES)
         return false;
 
     wchar_t filePath[MAX_PATH];
@@ -1023,14 +1071,12 @@ static bool TryAutoLaunch() {
     ReadFile(hFile, buf, sizeof(buf) - 1, &br, NULL);
     CloseHandle(hFile);
 
-    char storedKey[256] = {};
-    char storedHash[128] = {};
-    char storedMC[128] = {};
+    if (!ParseJsonString(buf, "key", out->storedKey, 256)) return false;
+    if (!ParseJsonString(buf, "hwid_hash", out->storedHash, 128)) return false;
+    if (!ParseJsonString(buf, "machine_code", out->storedMC, 128)) return false;
+    if (strlen(out->storedKey) < 10) return false;
 
-    if (!ParseJsonString(buf, "key", storedKey, 256)) return false;
-    if (!ParseJsonString(buf, "hwid_hash", storedHash, 128)) return false;
-    if (!ParseJsonString(buf, "machine_code", storedMC, 128)) return false;
-    if (strlen(storedKey) < 10) return false;
+    ParseJsonString(buf, "session_token", out->storedToken, 128);
 
     bool hwidMatch = false;
     char rawHwid[512] = {};
@@ -1038,10 +1084,10 @@ static bool TryAutoLaunch() {
     char currentHash[128] = {};
     ComputeEncryptedHWID(rawHwid, currentHash);
 
-    if (strcmp(storedHash, currentHash) == 0) {
+    if (strcmp(out->storedHash, currentHash) == 0) {
         char expectedMC[128] = {};
-        ComputeMachineCode(storedKey, currentHash, expectedMC);
-        if (strcmp(storedMC, expectedMC) == 0) hwidMatch = true;
+        ComputeMachineCode(out->storedKey, currentHash, expectedMC);
+        if (strcmp(out->storedMC, expectedMC) == 0) hwidMatch = true;
     }
 
     if (!hwidMatch) {
@@ -1049,31 +1095,34 @@ static bool TryAutoLaunch() {
         GetLegacyRawHWID(legacyHwid, 512);
         char legacyHash[128] = {};
         ComputeEncryptedHWID(legacyHwid, legacyHash);
-        if (strcmp(storedHash, legacyHash) == 0) {
+        if (strcmp(out->storedHash, legacyHash) == 0) {
             char expectedMC[128] = {};
-            ComputeMachineCode(storedKey, legacyHash, expectedMC);
-            if (strcmp(storedMC, expectedMC) == 0) hwidMatch = true;
+            ComputeMachineCode(out->storedKey, legacyHash, expectedMC);
+            if (strcmp(out->storedMC, expectedMC) == 0) hwidMatch = true;
         }
     }
 
-    if (!hwidMatch) return false;
+    return hwidMatch;
+}
+
+// ======================================================================
+// 自動啟動（網路驗證）：在背景執行緒中執行 Layer 4 + Layer 5
+// 完成後透過 WM_AUTOLAUNCH_DONE 通知主執行緒
+// ======================================================================
+static DWORD WINAPI AutoLaunchNetworkThread(LPVOID lpParam) {
+    AutoLaunchLocalData* data = (AutoLaunchLocalData*)lpParam;
+    if (!data) return 1;
 
     // ======================================================================
-    // 伺服器端 HWID 比對（Layer 4）：向伺服器確認該金鑰的 HWID 是否匹配
-    // 如果網路不可用 → 退回本機離線驗證（已通過）
-    // 如果伺服器回應 HWID 不匹配 → 顯示提示並返回 false
+    // Layer 4：伺服器端 HWID 比對
     // ======================================================================
     {
-        char storedToken[128] = {};
-        ParseJsonString(buf, "session_token", storedToken, 128);
-
-        // 建立 JSON 請求
         std::string json = "{";
-        json += "\"key\":\"";           json += JsonEscape(storedKey);     json += "\",";
-        json += "\"hwid_hash\":\"";     json += JsonEscape(storedHash);    json += "\",";
-        json += "\"machine_code\":\"";  json += JsonEscape(storedMC);      json += "\"";
-        if (storedToken[0]) {
-            json += ",\"session_token\":\""; json += JsonEscape(storedToken); json += "\"";
+        json += "\"key\":\"";           json += JsonEscape(data->storedKey);     json += "\",";
+        json += "\"hwid_hash\":\"";     json += JsonEscape(data->storedHash);    json += "\",";
+        json += "\"machine_code\":\"";  json += JsonEscape(data->storedMC);      json += "\"";
+        if (data->storedToken[0]) {
+            json += ",\"session_token\":\""; json += JsonEscape(data->storedToken); json += "\"";
         }
         json += "}";
 
@@ -1112,44 +1161,33 @@ static bool TryAutoLaunch() {
                             DWORD bytesRead = 0;
                             WinHttpReadData(hRequest, respBuf, sizeof(respBuf) - 1, &bytesRead);
 
-                            if (statusCode == 200 && strstr(respBuf, "\"valid\":true")) {
-                                // 伺服器確認 HWID 匹配 → 繼續啟動
-                            } else {
-                                // HWID 不匹配 → 顯示提示
+                            if (!(statusCode == 200 && strstr(respBuf, "\"valid\":true"))) {
+                                // HWID 不匹配
                                 WinHttpCloseHandle(hRequest);
                                 WinHttpCloseHandle(hConnect);
                                 WinHttpCloseHandle(hSession);
-                                MessageBoxW(NULL,
-                                    L"HWID \x4E0D\x5339\x914D\xFF01\n\n"
-                                    L"\x60A8\x7684\x88DD\x7F6E\x8207\x4F3A\x670D\x5668\x8A18\x9304\x4E0D\x4E00\x81F4\x3002\n"
-                                    L"\x8ACB\x524D\x5F80 Discord Bot \x6309\x4E0B\x3010\x91CD\x7F6E HWID\x3011\x6309\x9215\xFF0C\n"
-                                    L"\x7136\x5F8C\x91CD\x65B0\x555F\x52D5\x7A0B\x5F0F\x3002",
-                                    L"1yn AutoClick - HWID \x9A57\x8B49\x5931\x6557",
-                                    MB_ICONERROR | MB_OK);
-                                return false;
+                                delete data;
+                                PostMessageW(g_hwndMain, WM_AUTOLAUNCH_DONE, 0, 1);  // HWID 不匹配
+                                return 0;
                             }
                         }
                     }
-                    // 網路失敗 → 不阻止，退回本機驗證（已通過）
+                    // 網路失敗 → 不阻止，退回本機驗證
                     WinHttpCloseHandle(hRequest);
                 }
                 WinHttpCloseHandle(hConnect);
             }
             WinHttpCloseHandle(hSession);
         }
-        // 網路不可用時不阻止，允許離線啟動
     }
 
     // ======================================================================
-    // Google 試算表 HWID 比對（Layer 5）：向 GAS 查詢該金鑰的 HWID 資料
-    // 網路不可用 → 顯示「請連線網際網路後再次嘗試」
-    // 超過 20 秒無回應 → 顯示「請重新開啟應用程式」
-    // HWID 不匹配 → 返回 false（顯示輸入金鑰 UI）
+    // Layer 5：Google 試算表 HWID 比對
     // ======================================================================
     {
         std::string json = "{";
         json += "\"type\":\"hwid_query\",";
-        json += "\"key\":\"";  json += JsonEscape(storedKey);  json += "\"";
+        json += "\"key\":\"";  json += JsonEscape(data->storedKey);  json += "\"";
         json += "}";
 
         bool networkOk = false;
@@ -1177,7 +1215,7 @@ static bool TryAutoLaunch() {
                     DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
                     WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
 
-                    DWORD timeout = 20000;  // 20 秒超時
+                    DWORD timeout = 20000;
                     WinHttpSetOption(hRequest, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
                     WinHttpSetOption(hRequest, WINHTTP_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
                     WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
@@ -1194,16 +1232,14 @@ static bool TryAutoLaunch() {
                             DWORD bytesRead = 0;
                             WinHttpReadData(hRequest, respBuf, sizeof(respBuf) - 1, &bytesRead);
 
-                            // 解析回應：比對 hwid 和 machine_code
                             char sheetHwid[256] = {};
                             char sheetMC[256] = {};
                             if (ParseJsonString(respBuf, "hwid", sheetHwid, 256) &&
                                 ParseJsonString(respBuf, "machine_code", sheetMC, 256)) {
-                                // 試算表 HWID 為空 = 已被重置，需要重新綁定
                                 if (sheetHwid[0] == '\0' && sheetMC[0] == '\0') {
-                                    hwidMatched = false;  // 需要重新輸入金鑰
-                                } else if (strcmp(storedHash, sheetHwid) == 0 &&
-                                           strcmp(storedMC, sheetMC) == 0) {
+                                    hwidMatched = false;
+                                } else if (strcmp(data->storedHash, sheetHwid) == 0 &&
+                                           strcmp(data->storedMC, sheetMC) == 0) {
                                     hwidMatched = true;
                                 }
                             }
@@ -1211,7 +1247,6 @@ static bool TryAutoLaunch() {
                             timedOut = true;
                         }
                     } else {
-                        // SendRequest 失敗可能是超時
                         DWORD err = GetLastError();
                         if (err == ERROR_WINHTTP_TIMEOUT) timedOut = true;
                         else networkOk = false;
@@ -1228,32 +1263,30 @@ static bool TryAutoLaunch() {
         }
 
         if (!networkOk) {
-            MessageBoxW(NULL,
-                L"\x8ACB\x9023\x7DDA\x7DB2\x969B\x7DB2\x8DEF\x5F8C\x518D\x6B21\x5617\x8A66",
-                L"1yn AutoClick",
-                MB_ICONWARNING | MB_OK);
-            return false;
+            delete data;
+            PostMessageW(g_hwndMain, WM_AUTOLAUNCH_DONE, 0, 2);  // 網路不可用
+            return 0;
         }
 
         if (timedOut || (!gotResponse)) {
-            MessageBoxW(NULL,
-                L"\x8ACB\x91CD\x65B0\x958B\x555F\x61C9\x7528\x7A0B\x5F0F",
-                L"1yn AutoClick",
-                MB_ICONWARNING | MB_OK);
-            return false;
+            delete data;
+            PostMessageW(g_hwndMain, WM_AUTOLAUNCH_DONE, 0, 3);  // 超時
+            return 0;
         }
 
         if (!hwidMatched) {
-            // HWID 不匹配或已被重置 → 回到輸入金鑰 UI
-            return false;
+            delete data;
+            PostMessageW(g_hwndMain, WM_AUTOLAUNCH_DONE, 0, 0);  // HWID 不匹配（一般失敗）
+            return 0;
         }
     }
 
+    // 全部驗證通過 → 啟動 yy_clicker.exe
     wchar_t storedKeyW[512] = {};
-    MultiByteToWideChar(CP_UTF8, 0, storedKey, -1, storedKeyW, 512);
+    MultiByteToWideChar(CP_UTF8, 0, data->storedKey, -1, storedKeyW, 512);
 
     wchar_t cmdLine[1024];
-    wsprintfW(cmdLine, L"\"%s\" %s", clickerPath, storedKeyW);
+    wsprintfW(cmdLine, L"\"%s\" %s", data->clickerPath, storedKeyW);
 
     STARTUPINFOW si;
     ZeroMemory(&si, sizeof(si));
@@ -1265,10 +1298,14 @@ static bool TryAutoLaunch() {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         RegisterStartup();
-        return true;
+        delete data;
+        PostMessageW(g_hwndMain, WM_AUTOLAUNCH_DONE, 1, 0);  // 成功
+        return 0;
     }
 
-    return false;
+    delete data;
+    PostMessageW(g_hwndMain, WM_AUTOLAUNCH_DONE, 0, 0);  // CreateProcess 失敗
+    return 0;
 }
 
 // ======================================================================
@@ -1282,16 +1319,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmd, int nShow) {
     // 初始化 COM（用於 CoCreateGuid）
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
-    // 已驗證過的裝置直接啟動（不顯示 UI）
-    if (TryAutoLaunch()) {
-        CoUninitialize();
-        return 0;
-    }
-
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_STANDARD_CLASSES;
     InitCommonControlsEx(&icc);
+
+    // 本機驗證（毫秒級，不會阻塞）
+    AutoLaunchLocalData* autoData = new AutoLaunchLocalData();
+    bool localOk = TryAutoLaunchLocal(autoData);
 
     WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof(wc));
@@ -1319,11 +1354,27 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmd, int nShow) {
         posX, posY, WIN_W, WIN_H,
         NULL, NULL, hInst, NULL);
 
-    if (!hwnd) { CoUninitialize(); return 1; }
-    g_hwndMain = hwnd;  // 保存主視窗 HWND 供工作執行緒使用
+    if (!hwnd) { delete autoData; CoUninitialize(); return 1; }
+    g_hwndMain = hwnd;
 
-    if (hEditKey) {
-        g_origEditProc = (WNDPROC)SetWindowLongPtrW(hEditKey, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
+    if (localOk) {
+        // 本機驗證通過 → 顯示「正在驗證...」並在背景執行緒做網路驗證
+        g_autoLaunchMode = true;
+        // 隱藏金鑰輸入 UI，顯示驗證中狀態
+        if (hEditKey)   ShowWindow(hEditKey, SW_HIDE);
+        if (hBtnLaunch) ShowWindow(hBtnLaunch, SW_HIDE);
+        if (hLblStatus) SetWindowTextW(hLblStatus, L"\x6B63\x5728\x9A57\x8B49\xFF0C\x8ACB\x7A0D\x5019...");  // 「正在驗證，請稍候...」
+
+        // 啟動背景網路驗證執行緒
+        HANDLE hThread = CreateThread(NULL, 0, AutoLaunchNetworkThread, autoData, 0, NULL);
+        if (hThread) CloseHandle(hThread);
+        else { delete autoData; DestroyWindow(hwnd); CoUninitialize(); return 1; }
+    } else {
+        // 本機驗證失敗 → 顯示金鑰輸入 UI
+        delete autoData;
+        if (hEditKey) {
+            g_origEditProc = (WNDPROC)SetWindowLongPtrW(hEditKey, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
+        }
     }
 
     ShowWindow(hwnd, SW_SHOW);

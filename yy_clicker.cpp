@@ -40,6 +40,9 @@
 #include <cstdio>
 #include <bcrypt.h>
 #include <shellapi.h>
+#ifdef __GNUC__
+#include <cpuid.h>
+#endif
 
 // ===============================
 // Control IDs - Main Window
@@ -1689,18 +1692,30 @@ static void GetDiskSerial(char* outBuf, int bufSize) {
     }
 }
 
-// 取得 CPU ID（使用 __cpuid）
+// 取得 CPU ID
 static void GetCpuId(char* outBuf, int bufSize) {
+#ifdef __GNUC__
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    __cpuid(0, eax, ebx, ecx, edx);
+    unsigned int nIds = eax;
+    if (nIds >= 1) {
+        __cpuid(1, eax, ebx, ecx, edx);
+        snprintf(outBuf, bufSize, "%08X%08X", edx, eax);
+    } else {
+        strncpy(outBuf, "UNKNOWN_CPU", bufSize - 1);
+        outBuf[bufSize - 1] = '\0';
+    }
+#else
     int cpuInfo[4] = { 0 };
     __cpuid(cpuInfo, 0);
     int nIds = cpuInfo[0];
-
     if (nIds >= 1) {
         __cpuid(cpuInfo, 1);
         sprintf_s(outBuf, bufSize, "%08X%08X", cpuInfo[3], cpuInfo[0]);
     } else {
         strcpy_s(outBuf, bufSize, "UNKNOWN_CPU");
     }
+#endif
 }
 
 // 增強型原始 HWID（電腦名稱 + 使用者名稱 + 磁碟序號 + CPU ID）
