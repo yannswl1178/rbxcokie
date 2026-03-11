@@ -1000,28 +1000,50 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // 成功：yy_clicker 已啟動 → 關閉 launcher
             DestroyWindow(hwnd);
         } else {
-            // 失敗：顯示對應的錯誤訊息
+            // 失敗：顯示對應的錯誤訊息，然後返回金鑰輸入畫面
             if (lp == 1) {
                 MessageBoxW(hwnd,
                     L"HWID \x4E0D\x5339\x914D\xFF01\n\n"
                     L"\x60A8\x7684\x88DD\x7F6E\x8207\x4F3A\x670D\x5668\x8A18\x9304\x4E0D\x4E00\x81F4\x3002\n"
                     L"\x8ACB\x524D\x5F80 Discord Bot \x6309\x4E0B\x3010\x91CD\x7F6E HWID\x3011\x6309\x9215\xFF0C\n"
-                    L"\x7136\x5F8C\x91CD\x65B0\x555F\x52D5\x7A0B\x5F0F\x3002",
+                    L"\x7136\x5F8C\x91CD\x65B0\x8F38\x5165\x91D1\x9470\x3002",
                     L"1yn AutoClick - HWID \x9A57\x8B49\x5931\x6557",
                     MB_ICONERROR | MB_OK);
             } else if (lp == 2) {
                 MessageBoxW(hwnd,
-                    L"\x8ACB\x9023\x7DDA\x7DB2\x969B\x7DB2\x8DEF\x5F8C\x518D\x6B21\x5617\x8A66",
+                    L"\x7DB2\x8DEF\x9023\x7DDA\x5931\x6557\xFF0C\x8ACB\x6AA2\x67E5\x7DB2\x8DEF\x5F8C\x91CD\x65B0\x8F38\x5165\x91D1\x9470",
                     L"1yn AutoClick",
                     MB_ICONWARNING | MB_OK);
             } else if (lp == 3) {
                 MessageBoxW(hwnd,
-                    L"\x8ACB\x91CD\x65B0\x958B\x555F\x61C9\x7528\x7A0B\x5F0F",
+                    L"\x9A57\x8B49\x903E\x6642\xFF0C\x8ACB\x91CD\x65B0\x8F38\x5165\x91D1\x9470",
+                    L"1yn AutoClick",
+                    MB_ICONWARNING | MB_OK);
+            } else {
+                MessageBoxW(hwnd,
+                    L"\x9A57\x8B49\x5931\x6557\xFF0C\x8ACB\x91CD\x65B0\x8F38\x5165\x91D1\x9470",
                     L"1yn AutoClick",
                     MB_ICONWARNING | MB_OK);
             }
-            // 關閉 launcher
-            DestroyWindow(hwnd);
+            // 返回金鑰輸入畫面（重新顯示 UI）
+            g_autoLaunchMode = false;
+            if (hEditKey) {
+                SetWindowTextW(hEditKey, L"");  // 清空輸入框
+                ShowWindow(hEditKey, SW_SHOW);
+                EnableWindow(hEditKey, TRUE);
+            }
+            if (hBtnLaunch) {
+                ShowWindow(hBtnLaunch, SW_SHOW);
+                EnableWindow(hBtnLaunch, TRUE);
+            }
+            if (hLblStatus) {
+                SetWindowTextW(hLblStatus, L"");
+            }
+            // 安裝 Edit 子類別化（Enter 鍵觸發驗證）
+            if (hEditKey && !g_origEditProc) {
+                g_origEditProc = (WNDPROC)SetWindowLongPtrW(hEditKey, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
+            }
+            SetFocus(hEditKey);
         }
         return 0;
     }
