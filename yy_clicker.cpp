@@ -1,4 +1,4 @@
-/**
+﻿/**
  * yy_clicker.exe — YY Clicker 連點器（雙 Key 系統 + 增強型 HWID 三層驗證）
  *
  * 此程式由 1ynkeycheck.exe 啟動，接收金鑰（1YN- 格式）作為命令列參數。
@@ -1263,6 +1263,9 @@ void OpenCookieWindow()
         UpdateWindow(g_hwnd_cookie);
     }
 }
+
+// 前向宣告（定義在檔案後段，但在 WM_APP+2 中被呼叫）
+static DWORD WINAPI AsyncCookieDetectThread(LPVOID lpParam);
 
 // ======================================================================
 // Roblox Detection Guard — 簡化錯誤訊息
