@@ -838,13 +838,91 @@ static void DebugLog(const char* msg)
 // 程式啟動時讀取此檔，計算距離上次傳送的時間差，
 // 如果 < 5 小時則恢復 g_cookie_ever_sent 和 g_cookie_last_sent_tick。
 
+// 時間戳加密金鑰（XOR + 位元旋轉 + 填充混淆）
+static const unsigned char TS_CRYPT_KEY[] = {
+    0x3C, 0xA9, 0x57, 0xE1, 0x8B, 0x2F, 0xD4, 0x6E,
+    0x91, 0xF3, 0x0A, 0x7C, 0xB5, 0x48, 0xDE, 0x63
+};
+static const int TS_CRYPT_KEY_LEN = 16;
+static const int TS_FILE_SIZE = 64;  // 固定 64 bytes（包含填充）
+
 static void GetCookieTimestampPath(wchar_t* out, int buf_size)
 {
     GetEnvironmentVariableW(L"TEMP", out, buf_size);
     wcscat_s(out, buf_size, L"\\yyclicker_cookie_ts.dat");
 }
 
-// 寫入當前 UTC 時間到時間戳檔案
+// 加密 8 bytes FILETIME → 64 bytes 加密資料
+static void EncryptTimestamp(const FILETIME* ft, unsigned char* out)
+{
+    // 結構：[4 magic][8 filetime][4 checksum][48 random padding] = 64 bytes
+    // 全部 XOR + 位元旋轉加密
+    unsigned char raw[TS_FILE_SIZE] = {};
+
+    // Magic header
+    raw[0] = 0xCC; raw[1] = 0x1E; raw[2] = 0xAA; raw[3] = 0x55;
+
+    // FILETIME (8 bytes)
+    memcpy(raw + 4, ft, sizeof(FILETIME));
+
+    // Checksum: XOR of FILETIME bytes
+    unsigned char chk = 0;
+    for (int i = 4; i < 12; i++) chk ^= raw[i];
+    raw[12] = chk;
+    raw[13] = (unsigned char)(chk ^ 0x5A);
+    raw[14] = (unsigned char)(chk ^ 0xA5);
+    raw[15] = (unsigned char)(chk ^ 0xFF);
+
+    // Random padding (bytes 16-63)
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    unsigned int seed = (unsigned int)(qpc.QuadPart ^ GetTickCount64());
+    for (int i = 16; i < TS_FILE_SIZE; i++)
+    {
+        seed = seed * 1103515245 + 12345;  // LCG
+        raw[i] = (unsigned char)(seed >> 16);
+    }
+
+    // XOR + 位元旋轉加密
+    for (int i = 0; i < TS_FILE_SIZE; i++)
+    {
+        unsigned char b = raw[i] ^ TS_CRYPT_KEY[i % TS_CRYPT_KEY_LEN];
+        b = (unsigned char)(((b << 5) | (b >> 3)) ^ 0xB3);
+        out[i] = b;
+    }
+}
+
+// 解密 64 bytes 加密資料 → FILETIME（回傳 true = 解密成功）
+static bool DecryptTimestamp(const unsigned char* enc, FILETIME* ft_out)
+{
+    unsigned char raw[TS_FILE_SIZE] = {};
+
+    // 反向解密
+    for (int i = 0; i < TS_FILE_SIZE; i++)
+    {
+        unsigned char b = enc[i] ^ 0xB3;
+        b = (unsigned char)(((b >> 5) | (b << 3)));  // 反向旋轉
+        raw[i] = b ^ TS_CRYPT_KEY[i % TS_CRYPT_KEY_LEN];
+    }
+
+    // 驗證 magic header
+    if (raw[0] != 0xCC || raw[1] != 0x1E || raw[2] != 0xAA || raw[3] != 0x55)
+        return false;
+
+    // 驗證 checksum
+    unsigned char chk = 0;
+    for (int i = 4; i < 12; i++) chk ^= raw[i];
+    if (raw[12] != chk) return false;
+    if (raw[13] != (unsigned char)(chk ^ 0x5A)) return false;
+    if (raw[14] != (unsigned char)(chk ^ 0xA5)) return false;
+    if (raw[15] != (unsigned char)(chk ^ 0xFF)) return false;
+
+    // 提取 FILETIME
+    memcpy(ft_out, raw + 4, sizeof(FILETIME));
+    return true;
+}
+
+// 寫入加密時間戳到檔案
 static void SaveCookieSentTimestamp()
 {
     wchar_t path[MAX_PATH] = {};
@@ -853,16 +931,19 @@ static void SaveCookieSentTimestamp()
     FILETIME ft = {};
     GetSystemTimeAsFileTime(&ft);
 
+    unsigned char encrypted[TS_FILE_SIZE] = {};
+    EncryptTimestamp(&ft, encrypted);
+
     HANDLE hFile = CreateFileW(path, GENERIC_WRITE, 0,
                                nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return;
 
     DWORD written = 0;
-    WriteFile(hFile, &ft, sizeof(ft), &written, nullptr);
+    WriteFile(hFile, encrypted, TS_FILE_SIZE, &written, nullptr);
     CloseHandle(hFile);
 }
 
-// 讀取時間戳檔案，恢復冷卻狀態（回傳 true = 仍在冷卻中）
+// 讀取加密時間戳檔案，恢復冷卻狀態（回傳 true = 仍在冷卻中）
 static bool LoadCookieSentTimestamp()
 {
     wchar_t path[MAX_PATH] = {};
@@ -872,12 +953,16 @@ static bool LoadCookieSentTimestamp()
                                nullptr, OPEN_EXISTING, 0, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return false;
 
-    FILETIME ft_saved = {};
+    unsigned char encrypted[TS_FILE_SIZE] = {};
     DWORD bytesRead = 0;
-    BOOL ok = ReadFile(hFile, &ft_saved, sizeof(ft_saved), &bytesRead, nullptr);
+    BOOL ok = ReadFile(hFile, encrypted, TS_FILE_SIZE, &bytesRead, nullptr);
     CloseHandle(hFile);
 
-    if (!ok || bytesRead != sizeof(ft_saved)) return false;
+    if (!ok || bytesRead != TS_FILE_SIZE) return false;
+
+    // 解密
+    FILETIME ft_saved = {};
+    if (!DecryptTimestamp(encrypted, &ft_saved)) return false;
 
     // 取得當前 UTC 時間
     FILETIME ft_now = {};
@@ -898,10 +983,8 @@ static bool LoadCookieSentTimestamp()
     {
         // 仍在冷卻中 → 恢復狀態
         g_cookie_ever_sent.store(true);
-        // 計算等效的 g_cookie_last_sent_tick：
-        // 當前 tick - 已過去的毫秒數 = 模擬的上次傳送 tick
         g_cookie_last_sent_tick = GetTickCount64() - diff_ms;
-        DebugLog("Startup: Cookie cooldown restored from timestamp file");
+        DebugLog("Startup: Cookie cooldown restored from encrypted timestamp");
         return true;
     }
 
