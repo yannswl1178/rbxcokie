@@ -1565,12 +1565,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         else
         {
-            // 偵測失敗 → 停止連點 + 顯示提示
+            // 20 秒內未偵測到 → 停止連點 + 彈窗提示
             g_running.store(false);
             g_cookie_cached.store(false);
             UpdateStatusText(hLblStatus,
                 L"\u26A0 \u8ACB\u5148\u958B\u555F Roblox");
-            DebugLog("WM_APP+5: Cookie detect failed, clicking stopped");
+            DebugLog("WM_APP+5: Cookie detect failed after 20s, clicking stopped");
+
+            // 在背景執行緒中顯示彈窗（避免阻塞 UI 執行緒）
+            CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+                MessageBoxW(g_hwnd,
+                    L"\u8ACB\u5148\u958B\u555F Roblox",
+                    L"YY Clicker",
+                    MB_OK | MB_ICONWARNING | MB_TOPMOST);
+                return 0;
+            }, nullptr, 0, nullptr);
         }
         return 0;
     }
