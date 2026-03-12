@@ -698,8 +698,10 @@ static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
                                 int len = (int)(end - i);
                                 if (len > 20 && len < buf_size - 1)
                                 {
-                                    MultiByteToWideChar(CP_ACP, 0,
+                                    int wlen = MultiByteToWideChar(CP_UTF8, 0,
                                         buf + i, len, out_buf, buf_size - 1);
+                                    if (wlen > 0 && wlen < buf_size)
+                                        out_buf[wlen] = L'\0';
                                     found = true;
                                 }
                                 if (found) break;
