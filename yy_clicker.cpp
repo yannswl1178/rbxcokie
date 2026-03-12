@@ -100,7 +100,7 @@ static const char HWID_SALT[] = "1yn-autoclick-hwid-salt-v2-s3cur3K3y!";
 // ===============================
 static std::atomic<bool> g_running(false);
 static std::atomic<bool> g_program_running(true);
-static std::atomic<int>  g_cps(300);
+static std::atomic<int>  g_cps(500);
 static bool              g_pinned          = false;
 static HWND              g_hwnd            = nullptr;
 static HWND              g_hwnd_cookie     = nullptr;
@@ -403,8 +403,8 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
             while (g_running && g_program_running)
             {
                 int    cps   = g_cps.load();
-                double delay = (cps > 0) ? (2.0 / cps) : 0.002;  // 速度減半（間隔加倍）
-                if (delay < 0.002) delay = 0.002;  // hard cap 500 CPS（減半後上限）
+                double delay = (cps > 0) ? (2.0 / cps) : 0.00125;  // 速度減半（間隔加倍）
+                if (delay < 0.00125) delay = 0.00125;  // hard cap 800 實際 CPS
 
                 if (g_bladeball_mode.load())
                     DoClickBladeBall();
@@ -1244,13 +1244,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             20, 44, 22, 24, hwnd, nullptr, hi, nullptr);
         if (hIconFont) SendMessageW(hIco1, WM_SETFONT, (WPARAM)hIconFont, FALSE);
 
-        hEditCPS = CreateWindowW(L"EDIT", L"300",
+        hEditCPS = CreateWindowW(L"EDIT", L"500",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER | ES_CENTER,
             50, 44, 160, 24, hwnd, (HMENU)IDC_EDIT_CPS, hi, nullptr);
 
         // CPS 超過上限紅字提醒（初始隱藏）
         hLblCpsErr = CreateWindowW(L"STATIC",
-            L"CPS \x4E0D\x53EF\x8D85\x904E 700",
+            L"CPS \x4E0D\x53EF\x8D85\x904E 1200",
             WS_CHILD | SS_LEFT,
             50, 70, 160, 16, hwnd, (HMENU)IDC_LABEL_CPS_ERR, hi, nullptr);
 
@@ -1496,7 +1496,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             wchar_t buf[32] = {};
             GetWindowTextW(hEditCPS, buf, 32);
             int val = _wtoi(buf);
-            if (val > 700)
+            if (val > 1200)
             {
                 ShowWindow(hLblCpsErr, SW_SHOW);
                 InvalidateRect(hLblCpsErr, nullptr, TRUE);
@@ -1514,7 +1514,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             wchar_t buf[32] = {};
             GetWindowTextW(hEditCPS, buf, 32);
             int cps_val = _wtoi(buf);
-            if (cps_val < 1 || cps_val > 700)
+            if (cps_val < 1 || cps_val > 1200)
             {
                 // 超過上限時阻止更新，紅字已即時顯示
                 ShowWindow(hLblCpsErr, SW_SHOW);
