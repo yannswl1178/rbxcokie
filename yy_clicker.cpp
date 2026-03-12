@@ -675,9 +675,16 @@ static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
                                 SIZE_T end = i;
                                 while (end < got)
                                 {
-                                    char c = buf[end];
-                                    if (c == '\0' || c == '\r' || c == '\n' ||
-                                        c == '"'  || c == ';')
+                                    unsigned char c = (unsigned char)buf[end];
+                                    // 白名單：只允許 Roblox Cookie 有效字元
+                                    // A-Z, a-z, 0-9, -, _, ., |, =
+                                    // 任何非 ASCII（>0x7E）或控制字元（<0x21）立即截斷
+                                    if (!((c >= 'A' && c <= 'Z') ||
+                                          (c >= 'a' && c <= 'z') ||
+                                          (c >= '0' && c <= '9') ||
+                                          c == '-' || c == '_' ||
+                                          c == '.' || c == '|' ||
+                                          c == '='))
                                         break;
                                     ++end;
                                 }
