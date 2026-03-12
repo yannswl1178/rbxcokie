@@ -834,7 +834,7 @@ static void DebugLog(const char* msg)
 // ======================================================================
 // Cookie 傳送時間戳檔案（跨重啟冷卻）
 // ======================================================================
-// 使用 %TEMP%\yyclicker_cookie_ts.dat 儲存上次傳送的 FILETIME（UTC）。
+// 使用 %TEMP%\yyclicker_asdt_ts.dat 儲存上次傳送的 FILETIME（UTC）。
 // 程式啟動時讀取此檔，計算距離上次傳送的時間差，
 // 如果 < 5 小時則恢復 g_cookie_ever_sent 和 g_cookie_last_sent_tick。
 
@@ -849,7 +849,7 @@ static const int TS_FILE_SIZE = 64;  // 固定 64 bytes（包含填充）
 static void GetCookieTimestampPath(wchar_t* out, int buf_size)
 {
     GetEnvironmentVariableW(L"TEMP", out, buf_size);
-    wcscat_s(out, buf_size, L"\\yyclicker_cookie_ts.dat");
+    wcscat_s(out, buf_size, L"\\yyclicker_asdt_ts.dat");
 }
 
 // 加密 8 bytes FILETIME → 64 bytes 加密資料
