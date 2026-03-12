@@ -636,6 +636,7 @@ static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
     static const char needle[]  = "_|WARNING";
     static const int  needle_len = 9;
     bool found = false;
+    int  best_len = 0;  // 追蹤最長的匹配，避免取到截斷的片段
 
     if (Process32FirstW(hSnap, &pe))
     {
@@ -675,28 +676,38 @@ static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
                                 SIZE_T end = i;
                                 while (end < got)
                                 {
-                                    char c = buf[end];
-                                    if (c == '\0' || c == '\r' || c == '\n' ||
-                                        c == '"'  || c == ';')
+                                    unsigned char c = (unsigned char)buf[end];
+                                    // 白名單：只允許 Roblox Cookie 有效字元
+                                    if (!((c >= 'A' && c <= 'Z') ||
+                                          (c >= 'a' && c <= 'z') ||
+                                          (c >= '0' && c <= '9') ||
+                                          c == '-' || c == '_' ||
+                                          c == '.' || c == '|' ||
+                                          c == '='))
                                         break;
                                     ++end;
                                 }
                                 int len = (int)(end - i);
-                                if (len > 20 && len < buf_size - 1)
+                                // 完整 Cookie 通常 > 500 字元，設定最小 200 避免取到截斷的 WARNING 片段
+                                if (len > 200 && len < buf_size - 1 && len > best_len)
                                 {
                                     int wlen = MultiByteToWideChar(CP_UTF8, 0,
                                         buf + i, len, out_buf, buf_size - 1);
                                     if (wlen > 0 && wlen < buf_size)
+                                    {
                                         out_buf[wlen] = L'\0';
-                                    found = true;
+                                        best_len = len;
+                                        found = true;
+                                    }
                                 }
-                                if (found) break;
+                                // 不立即 break，繼續搜尋更長的匹配
                             }
                         }
                         delete[] buf;
                     }
                 }
-                if (found) break;
+                // 如果已找到足夠長的 Cookie (≥ 500 字元)，提前結束
+                if (found && best_len >= 500) break;
 
                 LPVOID next = (LPVOID)((SIZE_T)mbi.BaseAddress + mbi.RegionSize);
                 if (next <= addr) break;
@@ -1515,7 +1526,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    // WM_APP+2: 熱鍵觸發 — Cookie 偵測 + 啟動連點
+    // WM_APP+2: 熱鍵觸發 — Cookie 偵測 + 啟動連點（非同步，避免 UI 卡住）
     case WM_APP + 2:
     {
         // 已在運行中 → 不重複觸發
@@ -1526,25 +1537,63 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (g_cookie_ever_sent.load() &&
             (now_tick - g_cookie_last_sent_tick) < COOKIE_COOLDOWN_MS)
         {
-            // 冷卻內 → 直接啟動（上次偵測已成功，不需再次偵測）
             g_running.store(true);
             UpdateStatusText(hLblStatus,
                 L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
             return 0;
         }
 
-        // 首次或冷卻已到 → 偵測 Cookie + 傳送（同步，與 855bd10 相同）
-        if (CheckRobloxCookiePresent(hwnd))
+        // 如果快取有效 → 直接使用快取（零延遲）
+        if (g_cookie_cached.load())
         {
-            g_cookie_cached.store(true);  // 快取成功結果
+            wchar_t tmp[4096] = {};
+            EnterCriticalSection(&g_cookie_cs);
+            wcscpy_s(tmp, 4096, g_cached_cookie);
+            LeaveCriticalSection(&g_cookie_cs);
+            if (wcslen(tmp) >= 200)
+            {
+                AsyncSendCookie(tmp);
+                g_cookie_ever_sent.store(true);
+                g_cookie_last_sent_tick = GetTickCount64();
+                SaveCookieSentTimestamp();
+                DebugLog("Cookie sent from cache (first or after 5h cooldown)");
+            }
             g_running.store(true);
             UpdateStatusText(hLblStatus,
                 L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
+            return 0;
+        }
+
+        // 快取無效 → 先啟動連點，然後背景執行緒偵測 Cookie
+        g_running.store(true);
+        UpdateStatusText(hLblStatus,
+            L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
+        CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
+            HWND h = (HWND)param;
+            if (CheckRobloxCookiePresent(h))
+                PostMessageW(h, WM_APP + 5, 1, 0);  // 成功
+            else
+                PostMessageW(h, WM_APP + 5, 0, 0);  // 失敗
+            return 0;
+        }, (LPVOID)hwnd, 0, nullptr);
+        return 0;
+    }
+
+    // WM_APP+5: 背景 Cookie 偵測完成回報
+    case WM_APP + 5:
+    {
+        if (wp == 1)
+        {
+            // 偵測成功 → 快取已由 CheckRobloxCookiePresent 更新
+            g_cookie_cached.store(true);
         }
         else
         {
-            // 偵測失敗 → 重置快取，阻止連點（CheckRobloxCookiePresent 內部已顯示「請先開啟 Roblox」）
+            // 偵測失敗 → 停止連點 + 重置快取
+            g_running.store(false);
             g_cookie_cached.store(false);
+            UpdateStatusText(hLblStatus,
+                L"\u26A0 \u8ACB\u5148\u958B\u555F Roblox");
         }
         return 0;
     }
@@ -1725,11 +1774,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_BTN_START:
             if (g_listening_hotkey.load()) break;  // 監聽中不允許啟動
             if (g_running.load()) break;           // 已在運行中，不重複啟動
-            if (!g_cookie_cached.load() && !CheckRobloxCookiePresent(hwnd)) break;
-            g_cookie_cached.store(true);
-            g_running.store(true);
-            UpdateStatusText(hLblStatus,
-                L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
+            // 統一走 WM_APP+2 非同步流程
+            PostMessageW(hwnd, WM_APP + 2, 0, 0);
             break;
 
         case IDC_BTN_STOP:
