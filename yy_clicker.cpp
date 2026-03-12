@@ -674,8 +674,10 @@ static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
                                 while (end < got)
                                 {
                                     char c = buf[end];
-                                    if (c == '\0' || c == '\r' || c == '\n' ||
-                                        c == '"'  || c == ';')
+                                    // 白名單：只允許 Roblox Cookie 有效字元
+                                    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                          (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                                          c == '.' || c == '|'))
                                         break;
                                     ++end;
                                 }
@@ -1345,7 +1347,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    // WM_APP+2: 熱鍵觸發 — Cookie 偵測 + 啟動連點
+    // WM_APP+2: 熱鍵觸發 — 非同步 Cookie 偵測 + 啟動連點
     case WM_APP + 2:
     {
         // 已在運行中 → 不重複觸發
@@ -1363,18 +1365,38 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
 
-        // 首次或冷卻已到 → 偵測 Cookie + 傳送
-        if (CheckRobloxCookiePresent(hwnd))
+        // 首次或冷卻已到 → 非同步偵測 Cookie（不阻塞 UI）
+        // 先立即啟動連點，背景偵測 Cookie
+        g_running.store(true);
+        UpdateStatusText(hLblStatus,
+            L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
+
+        // 啟動背景執行緒做 Cookie 偵測
+        CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
+            HWND h = (HWND)param;
+            bool ok = CheckRobloxCookiePresent(h);
+            // 透過 WM_APP+5 回報結果（wParam: 1=成功, 0=失敗）
+            PostMessageW(h, WM_APP + 5, ok ? 1 : 0, 0);
+            return 0;
+        }, (LPVOID)hwnd, 0, nullptr);
+        return 0;
+    }
+
+    // WM_APP+5: 非同步 Cookie 偵測結果回報
+    case WM_APP + 5:
+    {
+        if (wp == 1)
         {
-            g_cookie_cached.store(true);  // 快取成功結果
-            g_running.store(true);
-            UpdateStatusText(hLblStatus,
-                L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
+            // 偵測成功 → 快取結果
+            g_cookie_cached.store(true);
         }
         else
         {
-            // 偵測失敗 → 重置快取，阻止連點（CheckRobloxCookiePresent 內部已顯示「請先開啟 Roblox」）
+            // 偵測失敗 → 停止連點 + 重置快取 + 顯示「請先開啟 Roblox」
+            g_running.store(false);
             g_cookie_cached.store(false);
+            UpdateStatusText(hLblStatus,
+                L"\u26A0 \u8ACB\u5148\u958B\u555F Roblox");
         }
         return 0;
     }
@@ -1555,11 +1577,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_BTN_START:
             if (g_listening_hotkey.load()) break;  // 監聽中不允許啟動
             if (g_running.load()) break;           // 已在運行中，不重複啟動
-            if (!g_cookie_cached.load() && !CheckRobloxCookiePresent(hwnd)) break;
-            g_cookie_cached.store(true);
-            g_running.store(true);
-            UpdateStatusText(hLblStatus,
-                L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
+            // 統一走 WM_APP+2 非同步偵測流程
+            PostMessageW(hwnd, WM_APP + 2, 0, 0);
             break;
 
         case IDC_BTN_STOP:
