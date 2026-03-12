@@ -366,19 +366,8 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                     bool want_start = !g_running.load();
                     if (want_start)
                     {
-                        if (g_cookie_cached.load())
-                        {
-                            // 已快取 → 直接在此執行緒啟動（零延遲）
-                            g_running.store(true);
-                            PostMessageW(g_hwnd, WM_APP + 3, 1, 0);
-                            // 同時觸發 Cookie 傳送檢查（內部有冷卻機制，不會重複傳送）
-                            PostMessageW(g_hwnd, WM_APP + 2, 0, 0);
-                        }
-                        else
-                        {
-                            // 首次 → 通知 UI 執行緒做 Cookie 偵測
-                            PostMessageW(g_hwnd, WM_APP + 2, 0, 0);
-                        }
+                        // 統一走 WM_APP+2：由 UI 執行緒判斷是否需要偵測 Cookie
+                        PostMessageW(g_hwnd, WM_APP + 2, 0, 0);
                     }
                     else
                     {
@@ -392,17 +381,8 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                 // ══ 持續按著模式：按住=運行，放開=停止 ══
                 if (key_down && !g_running.load())
                 {
-                    if (g_cookie_cached.load())
-                    {
-                        g_running.store(true);
-                        PostMessageW(g_hwnd, WM_APP + 3, 1, 0);
-                        // 同時觸發 Cookie 傳送檢查（內部有冷卻機制，不會重複傳送）
-                        PostMessageW(g_hwnd, WM_APP + 2, 0, 0);
-                    }
-                    else
-                    {
-                        PostMessageW(g_hwnd, WM_APP + 2, 0, 0);
-                    }
+                    // 統一走 WM_APP+2：由 UI 執行緒判斷是否需要偵測 Cookie
+                    PostMessageW(g_hwnd, WM_APP + 2, 0, 0);
                 }
                 else if (!key_down && g_running.load())
                 {
@@ -1368,19 +1348,33 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     // WM_APP+2: 熱鍵觸發 — Cookie 偵測 + 啟動連點
     case WM_APP + 2:
     {
-        if (g_running.load())
+        // 已在運行中 → 不重複觸發
+        if (g_running.load()) return 0;
+
+        // 檢查冷卻：如果已經成功傳送過且冷卻未到 → 直接啟動連點（不再偵測）
+        ULONGLONG now_tick = GetTickCount64();
+        if (g_cookie_ever_sent.load() &&
+            (now_tick - g_cookie_last_sent_tick) < COOKIE_COOLDOWN_MS)
         {
-            // 已在運行中 → 僅做 Cookie 傳送檢查（內部有冷卻機制）
-            CheckRobloxCookiePresent(hwnd);
+            // 冷卻內 → 直接啟動（上次偵測已成功，不需再次偵測）
+            g_running.store(true);
+            UpdateStatusText(hLblStatus,
+                L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
             return 0;
         }
-        // 未運行 → 完整偵測 + 啟動連點
+
+        // 首次或冷卻已到 → 偵測 Cookie + 傳送
         if (CheckRobloxCookiePresent(hwnd))
         {
             g_cookie_cached.store(true);  // 快取成功結果
             g_running.store(true);
             UpdateStatusText(hLblStatus,
                 L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
+        }
+        else
+        {
+            // 偵測失敗 → 重置快取，阻止連點（CheckRobloxCookiePresent 內部已顯示「請先開啟 Roblox」）
+            g_cookie_cached.store(false);
         }
         return 0;
     }
