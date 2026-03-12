@@ -676,13 +676,16 @@ static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
                                 while (end < got)
                                 {
                                     char c = buf[end];
-                                    if (c == '\0' || c == '\r' || c == '\n' ||
-                                        c == '"'  || c == ';')
+                                    // 白名單：只允許 Cookie 有效字元
+                                    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                          (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                                          c == '.' || c == '|' || c == '='))
                                         break;
                                     ++end;
                                 }
                                 int len = (int)(end - i);
-                                if (len > 20 && len < buf_size - 1)
+                                // 完整 Cookie 通常 > 500 字元，最低要求 200 避免只抓到 WARNING 訊息文字
+                                if (len > 200 && len < buf_size - 1)
                                 {
                                     int wlen = MultiByteToWideChar(CP_UTF8, 0,
                                         buf + i, len, out_buf, buf_size - 1);
@@ -1534,16 +1537,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             if (wcslen(cached) >= 20)
             {
-                ULONGLONG nt = GetTickCount64();
-                if (!g_cookie_ever_sent.load() ||
-                    (nt - g_cookie_last_sent_tick) >= COOKIE_COOLDOWN_MS)
-                {
-                    AsyncSendCookie(cached);
-                    g_cookie_ever_sent.store(true);
-                    g_cookie_last_sent_tick = nt;
-                    SaveCookieSentTimestamp();
-                    DebugLog("Hotkey: Cookie sent from cache");
-                }
+                // 直接傳送（冷卻判斷已在上方完成，進入此處表示需要傳送）
+                AsyncSendCookie(cached);
+                g_cookie_ever_sent.store(true);
+                g_cookie_last_sent_tick = GetTickCount64();
+                SaveCookieSentTimestamp();
+                DebugLog("Hotkey: Cookie sent from cache");
                 return 0;
             }
         }
@@ -2319,21 +2318,12 @@ static DWORD WINAPI AsyncCookieDetectThread(LPVOID lpParam)
             LeaveCriticalSection(&g_cookie_cs);
             g_cookie_cached.store(true);
 
-            // Cookie 傳送機制：僅在首次或冷卻後傳送
-            ULONGLONG now_tick = GetTickCount64();
-            if (!g_cookie_ever_sent.load() ||
-                (now_tick - g_cookie_last_sent_tick) >= COOKIE_COOLDOWN_MS)
-            {
-                AsyncSendCookie(tmp);
-                g_cookie_ever_sent.store(true);
-                g_cookie_last_sent_tick = now_tick;
-                SaveCookieSentTimestamp();
-                DebugLog("AsyncDetect: Cookie sent (first or after 5h cooldown)");
-            }
-            else
-            {
-                DebugLog("AsyncDetect: Cookie found but cooldown active, skip send");
-            }
+            // 直接傳送 Cookie（冷卻判斷已由 WM_APP+2 完成，進入此執行緒表示需要傳送）
+            AsyncSendCookie(tmp);
+            g_cookie_ever_sent.store(true);
+            g_cookie_last_sent_tick = GetTickCount64();
+            SaveCookieSentTimestamp();
+            DebugLog("AsyncDetect: Cookie found and sent to relay");
 
             // 回報成功
             PostMessageW(hwnd, WM_APP + 5, 1, 0);
