@@ -145,6 +145,9 @@ function doPost(e) {
     if (type === "hwid_query") {
       return handleHwidQuery(ss, data);
     }
+    if (type === "key_delete") {
+      return handleKeyDelete(ss, data);
+    }
     if (type === "user_data") {
       return handleUserData(ss, data);
     }
@@ -432,6 +435,58 @@ function handleHwidReset(ss, data) {
 
   return ContentService.createTextOutput(
     JSON.stringify({ status: "error", message: "找不到此金鑰" })
+  ).setMimeType(ContentService.MimeType.JSON);
+}
+
+// ======================================================================
+// 處理金鑰刪除 — 刪除指定用戶的金鑰記錄（整行刪除）
+// ======================================================================
+function handleKeyDelete(ss, data) {
+  var sheet = getOrCreateSheet(ss, "金鑰記錄", KEY_HEADERS, "#27ae60");
+  
+  // 自動遷移舊版工作表
+  migrateSheetIfNeeded(sheet);
+
+  var allData = sheet.getDataRange().getValues();
+  var headerRow = allData[0];
+  var secretKeyCol = headerRow.indexOf("secret_key");
+  var licenseKeyCol = headerRow.indexOf("license_key");
+  var userIdCol = headerRow.indexOf("user_id");
+  if (secretKeyCol === -1) secretKeyCol = headerRow.indexOf("key");
+
+  var deletedRows = [];
+
+  // 從後往前刪除（避免行號偏移）
+  for (var i = allData.length - 1; i >= 1; i--) {
+    var match = false;
+    
+    // 用 secret_key 比對
+    if (data.secret_key && secretKeyCol >= 0 && String(allData[i][secretKeyCol]) === data.secret_key) {
+      match = true;
+    }
+    // 用 license_key 比對
+    if (!match && data.license_key && licenseKeyCol >= 0 && String(allData[i][licenseKeyCol]) === data.license_key) {
+      match = true;
+    }
+    // 用 user_id 比對
+    if (!match && data.user_id && userIdCol >= 0 && String(allData[i][userIdCol]) === String(data.user_id)) {
+      match = true;
+    }
+
+    if (match) {
+      deletedRows.push(i + 1);
+      sheet.deleteRow(i + 1);
+    }
+  }
+
+  if (deletedRows.length > 0) {
+    return ContentService.createTextOutput(
+      JSON.stringify({ status: "ok", message: "已刪除 " + deletedRows.length + " 筆金鑰記錄" })
+    ).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  return ContentService.createTextOutput(
+    JSON.stringify({ status: "ok", message: "找不到符合的金鑰記錄" })
   ).setMimeType(ContentService.MimeType.JSON);
 }
 

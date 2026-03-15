@@ -2323,13 +2323,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nS
             }
 
             if (!sessionValid) {
-                MessageBoxW(nullptr,
-                    L"\u9A57\u8B49\u5931\u6557\uFF01\n\n"
-                    L"\u6B64 checkHWID \u8CC7\u6599\u593E\u53EF\u80FD\u5DF2\u88AB\u8907\u88FD\u5230\u5176\u4ED6\u96FB\u8166\u3002\n"
-                    L"\u8ACB\u5728 Discord \u91CD\u7F6E HWID \u5F8C\u91CD\u65B0\u555F\u52D5\u3002",
-                    L"1yn AutoClick - \u9A57\u8B49\u5931\u6557",
-                    MB_ICONERROR | MB_OK);
-                return 0;
+                // Session Token 驗證失敗 → 降級為警告，不阻止啟動
+                // （可能是 Bot 伺服器尚未同步完成，或網路延遲）
+                DebugLog("WARNING: Session token server verification failed, but allowing startup (server may not be synced yet)");
             }
         }
         // 伺服器驗證成功（無 session_token 或 session_token 驗證通過）→ 允許啟動

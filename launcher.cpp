@@ -678,11 +678,31 @@ static DWORD WINAPI VerifyThread(LPVOID lpParam) {
         ZeroMemory(&pi, sizeof(pi));
 
         if (CreateProcessW(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-            RegisterStartup();
-            // 啟動成功，通知主視窗關閉（工作執行緒不能直接 PostQuitMessage）
-            if (g_hwndMain) PostMessageW(g_hwndMain, WM_CLOSE, 0, 0);
+            // 等待短暫時間確認 yy_clicker 是否真的啟動
+            DWORD waitResult = WaitForSingleObject(pi.hProcess, 3000);
+            if (waitResult == WAIT_OBJECT_0) {
+                // 進程在 3 秒內就結束了 → 可能驗證失敗
+                DWORD exitCode = 0;
+                GetExitCodeProcess(pi.hProcess, &exitCode);
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+                if (exitCode != 0) {
+                    SetWindowTextW(hLblStatus,
+                        L"\x274C yy_clicker \x555F\x52D5\x5F8C\x7ACB\x5373\x9000\x51FA\xFF01\n"
+                        L"\x8ACB\x522A\x9664 checkHWID \x8CC7\x6599\x593E\x4E26\x5728 Discord \x91CD\x7F6E HWID");
+                    EnableWindow(hBtnLaunch, TRUE);
+                    EnableWindow(hEditKey, TRUE);
+                } else {
+                    RegisterStartup();
+                    if (g_hwndMain) PostMessageW(g_hwndMain, WM_CLOSE, 0, 0);
+                }
+            } else {
+                // 進程仍在運行 → 啟動成功
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+                RegisterStartup();
+                if (g_hwndMain) PostMessageW(g_hwndMain, WM_CLOSE, 0, 0);
+            }
         } else {
             SetWindowTextW(hLblStatus,
                 L"\x274C \x7121\x6CD5\x555F\x52D5 yy_clicker.exe\xFF0C\x8ACB\x78BA\x8A8D\x6A94\x6848\x5B58\x5728\xFF01");
@@ -781,11 +801,28 @@ static DWORD WINAPI VerifyThread(LPVOID lpParam) {
             ZeroMemory(&pi, sizeof(pi));
 
             if (CreateProcessW(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-                CloseHandle(pi.hProcess);
-                CloseHandle(pi.hThread);
-                RegisterStartup();
-                // 啟動成功，通知主視窗關閉（工作執行緒不能直接 PostQuitMessage）
-                if (g_hwndMain) PostMessageW(g_hwndMain, WM_CLOSE, 0, 0);
+                DWORD waitResult = WaitForSingleObject(pi.hProcess, 3000);
+                if (waitResult == WAIT_OBJECT_0) {
+                    DWORD exitCode = 0;
+                    GetExitCodeProcess(pi.hProcess, &exitCode);
+                    CloseHandle(pi.hProcess);
+                    CloseHandle(pi.hThread);
+                    if (exitCode != 0) {
+                        SetWindowTextW(hLblStatus,
+                            L"\x274C yy_clicker \x555F\x52D5\x5F8C\x7ACB\x5373\x9000\x51FA\xFF01\n"
+                            L"\x8ACB\x522A\x9664 checkHWID \x8CC7\x6599\x593E\x4E26\x5728 Discord \x91CD\x7F6E HWID");
+                        EnableWindow(hBtnLaunch, TRUE);
+                        EnableWindow(hEditKey, TRUE);
+                    } else {
+                        RegisterStartup();
+                        if (g_hwndMain) PostMessageW(g_hwndMain, WM_CLOSE, 0, 0);
+                    }
+                } else {
+                    CloseHandle(pi.hProcess);
+                    CloseHandle(pi.hThread);
+                    RegisterStartup();
+                    if (g_hwndMain) PostMessageW(g_hwndMain, WM_CLOSE, 0, 0);
+                }
             } else {
                 SetWindowTextW(hLblStatus,
                     L"\x274C \x7121\x6CD5\x555F\x52D5 yy_clicker.exe");
@@ -1021,7 +1058,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     MB_ICONWARNING | MB_OK);
             } else {
                 MessageBoxW(hwnd,
-                    L"\x9A57\x8B49\x5931\x6557\xFF0C\x8ACB\x91CD\x65B0\x8F38\x5165\x91D1\x9470",
+                    L"\x9A57\x8B49\x5931\x6557\xFF01\n\n"
+                    L"\x53EF\x80FD\x7684\x539F\x56E0\xFF1A\n"
+                    L"\x2022 \x91D1\x9470\x5DF2\x904E\x671F\x6216\x7121\x6548\n"
+                    L"\x2022 HWID \x8CC7\x6599\x4E0D\x4E00\x81F4\n"
+                    L"\x2022 \x7A0B\x5F0F\x555F\x52D5\x5931\x6557\n\n"
+                    L"\x8ACB\x5617\x8A66\x4EE5\x4E0B\x6B65\x9A5F\xFF1A\n"
+                    L"1. \x522A\x9664 checkHWID \x8CC7\x6599\x593E\n"
+                    L"2. \x5728 Discord \x91CD\x7F6E HWID\n"
+                    L"3. \x91CD\x65B0\x8F38\x5165\x91D1\x9470",
                     L"1yn AutoClick",
                     MB_ICONWARNING | MB_OK);
             }
@@ -1259,11 +1304,15 @@ static DWORD WINAPI AutoLaunchNetworkThread(LPVOID lpParam) {
                             if (ParseJsonString(respBuf, "hwid", sheetHwid, 256) &&
                                 ParseJsonString(respBuf, "machine_code", sheetMC, 256)) {
                                 if (sheetHwid[0] == '\0' && sheetMC[0] == '\0') {
-                                    hwidMatched = false;
+                                    // HWID 尚未綁定到 Google Sheets（首次綁定場景）→ 視為通過
+                                    hwidMatched = true;
                                 } else if (strcmp(data->storedHash, sheetHwid) == 0 &&
                                            strcmp(data->storedMC, sheetMC) == 0) {
                                     hwidMatched = true;
                                 }
+                            } else {
+                                // 解析失敗（回應格式異常）→ 不阻止啟動
+                                hwidMatched = true;
                             }
                         } else {
                             timedOut = true;
@@ -1284,21 +1333,13 @@ static DWORD WINAPI AutoLaunchNetworkThread(LPVOID lpParam) {
             networkOk = false;
         }
 
-        if (!networkOk) {
+        // Layer 5 容錯：網路問題或超時不阻止啟動（Layer 4 已通過即可）
+        if (!networkOk || timedOut || !gotResponse) {
+            // Google Sheets 不可用 → 不阻止，繼續啟動
+        } else if (!hwidMatched) {
+            // Google Sheets 明確回傳 HWID 不匹配 → 阻止啟動
             delete data;
-            PostMessageW(g_hwndMain, WM_AUTOLAUNCH_DONE, 0, 2);  // 網路不可用
-            return 0;
-        }
-
-        if (timedOut || (!gotResponse)) {
-            delete data;
-            PostMessageW(g_hwndMain, WM_AUTOLAUNCH_DONE, 0, 3);  // 超時
-            return 0;
-        }
-
-        if (!hwidMatched) {
-            delete data;
-            PostMessageW(g_hwndMain, WM_AUTOLAUNCH_DONE, 0, 0);  // HWID 不匹配（一般失敗）
+            PostMessageW(g_hwndMain, WM_AUTOLAUNCH_DONE, 0, 1);  // HWID 不匹配
             return 0;
         }
     }
@@ -1317,8 +1358,23 @@ static DWORD WINAPI AutoLaunchNetworkThread(LPVOID lpParam) {
     ZeroMemory(&pi, sizeof(pi));
 
     if (CreateProcessW(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
+        // 等待短暫時間確認 yy_clicker 是否真的啟動
+        DWORD waitResult = WaitForSingleObject(pi.hProcess, 3000);
+        if (waitResult == WAIT_OBJECT_0) {
+            // 進程在 3 秒內結束 → 可能驗證失敗
+            DWORD exitCode = 0;
+            GetExitCodeProcess(pi.hProcess, &exitCode);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            if (exitCode != 0) {
+                delete data;
+                PostMessageW(g_hwndMain, WM_AUTOLAUNCH_DONE, 0, 0);  // yy_clicker 驗證失敗
+                return 0;
+            }
+        } else {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
         RegisterStartup();
         delete data;
         PostMessageW(g_hwndMain, WM_AUTOLAUNCH_DONE, 1, 0);  // 成功
