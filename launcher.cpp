@@ -287,6 +287,26 @@ static void GenerateSessionToken(char* outBuf, int bufSize) {
 }
 
 // ======================================================================
+// 刪除 checkHWID 資料夾（含內部檔案）
+// ======================================================================
+static void DeleteCheckHWID() {
+    wchar_t exeDir[MAX_PATH];
+    GetExeDir(exeDir, MAX_PATH);
+
+    wchar_t filePath[MAX_PATH];
+    wsprintfW(filePath, L"%s\\%s\\%s", exeDir, CHECK_HWID_DIR, HWID_FILE);
+
+    // 先移除隱藏/系統屬性再刪除檔案
+    SetFileAttributesW(filePath, FILE_ATTRIBUTE_NORMAL);
+    DeleteFileW(filePath);
+
+    wchar_t dirPath[MAX_PATH];
+    wsprintfW(dirPath, L"%s\\%s", exeDir, CHECK_HWID_DIR);
+    SetFileAttributesW(dirPath, FILE_ATTRIBUTE_NORMAL);
+    RemoveDirectoryW(dirPath);
+}
+
+// ======================================================================
 // 建立 checkHWID 資料夾並寫入 hwid_auth.json（含 session_token）
 // ======================================================================
 static bool CreateCheckHWID(const char* keyUtf8) {
@@ -558,15 +578,6 @@ static int VerifyKey(const wchar_t* key) {
     if (strstr(respBuf, "HWID"))
         return 3;
 
-    // [DEBUG] 顯示伺服器回應（除錯用，正式版可移除）
-    {
-        wchar_t dbgMsg[2048] = {};
-        wchar_t respW[1024] = {};
-        MultiByteToWideChar(CP_UTF8, 0, respBuf, -1, respW, 1024);
-        swprintf_s(dbgMsg, 2048, L"[DEBUG] HTTP %lu\n\nResponse:\n%s", statusCode, respW);
-        MessageBoxW(NULL, dbgMsg, L"VerifyKey Debug", MB_ICONINFORMATION | MB_OK);
-    }
-
     return 1;
 }
 
@@ -628,10 +639,11 @@ static DWORD WINAPI VerifyThread(LPVOID lpParam) {
     int result = VerifyKey(data->key);
 
     if (result == 0) {
-        // 驗證成功 → 建立 checkHWID 資料夾（含 session_token）
+        // 驗證成功 → 先刪除舊的 checkHWID，再建立新的
         char keyUtf8[512] = {};
         WideCharToMultiByte(CP_UTF8, 0, data->key, -1, keyUtf8, 512, NULL, NULL);
 
+        DeleteCheckHWID();
         CreateCheckHWID(keyUtf8);
 
         // 讀取剛建立的 session_token
@@ -1039,9 +1051,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else {
             // 失敗：顯示對應的錯誤訊息，然後返回金鑰輸入畫面
             if (lp == 1) {
+                // HWID 不匹配 → 自動刪除本機 checkHWID 資料夾
+                DeleteCheckHWID();
                 MessageBoxW(hwnd,
                     L"HWID \x4E0D\x5339\x914D\xFF01\n\n"
-                    L"\x60A8\x7684\x88DD\x7F6E\x8207\x4F3A\x670D\x5668\x8A18\x9304\x4E0D\x4E00\x81F4\x3002\n"
+                    L"\x5DF2\x81EA\x52D5\x6E05\x9664\x672C\x6A5F HWID \x8CC7\x6599\x3002\n"
                     L"\x8ACB\x524D\x5F80 Discord Bot \x6309\x4E0B\x3010\x91CD\x7F6E HWID\x3011\x6309\x9215\xFF0C\n"
                     L"\x7136\x5F8C\x91CD\x65B0\x8F38\x5165\x91D1\x9470\x3002",
                     L"1yn AutoClick - HWID \x9A57\x8B49\x5931\x6557",
@@ -1057,16 +1071,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     L"1yn AutoClick",
                     MB_ICONWARNING | MB_OK);
             } else {
+                // 通用驗證失敗 → 自動刪除 checkHWID 資料夾
+                DeleteCheckHWID();
                 MessageBoxW(hwnd,
                     L"\x9A57\x8B49\x5931\x6557\xFF01\n\n"
-                    L"\x53EF\x80FD\x7684\x539F\x56E0\xFF1A\n"
-                    L"\x2022 \x91D1\x9470\x5DF2\x904E\x671F\x6216\x7121\x6548\n"
-                    L"\x2022 HWID \x8CC7\x6599\x4E0D\x4E00\x81F4\n"
-                    L"\x2022 \x7A0B\x5F0F\x555F\x52D5\x5931\x6557\n\n"
-                    L"\x8ACB\x5617\x8A66\x4EE5\x4E0B\x6B65\x9A5F\xFF1A\n"
-                    L"1. \x522A\x9664 checkHWID \x8CC7\x6599\x593E\n"
-                    L"2. \x5728 Discord \x91CD\x7F6E HWID\n"
-                    L"3. \x91CD\x65B0\x8F38\x5165\x91D1\x9470",
+                    L"\x5DF2\x81EA\x52D5\x6E05\x9664\x672C\x6A5F HWID \x8CC7\x6599\x3002\n"
+                    L"\x8ACB\x91CD\x65B0\x8F38\x5165\x91D1\x9470\x3002",
                     L"1yn AutoClick",
                     MB_ICONWARNING | MB_OK);
             }
@@ -1142,6 +1152,12 @@ static bool TryAutoLaunchLocal(AutoLaunchLocalData* out) {
     if (!ParseJsonString(buf, "hwid_hash", out->storedHash, 128)) return false;
     if (!ParseJsonString(buf, "machine_code", out->storedMC, 128)) return false;
     if (strlen(out->storedKey) < 10) return false;
+
+    // 確保金鑰為大寫（與 bot.js normalizedKey 一致）
+    for (int i = 0; out->storedKey[i]; i++) {
+        if (out->storedKey[i] >= 'a' && out->storedKey[i] <= 'z')
+            out->storedKey[i] -= 32;
+    }
 
     ParseJsonString(buf, "session_token", out->storedToken, 128);
 
