@@ -659,7 +659,8 @@ static bool TryCookieFromStorePackage(wchar_t* out_buf, int buf_size)
     return found;
 }
 
-// Layer 4: Process Memory Scan
+// Layer 4: Process Memory Scan（最高優先級）
+// 改進：掃描所有匹配的 Cookie，選擇最長的那個（最完整的通常是當前有效的）
 static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
 {
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -670,7 +671,10 @@ static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
 
     static const char needle[]  = "_|WARNING";
     static const int  needle_len = 9;
-    bool found = false;
+
+    // 暫存最佳候選 Cookie（最長的）
+    char* best_cookie = nullptr;
+    int   best_len    = 0;
 
     if (Process32FirstW(hSnap, &pe))
     {
@@ -707,6 +711,10 @@ static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
                             {
                                 if (memcmp(buf + i, needle, needle_len) != 0) continue;
 
+                                // 往前回溯找完整 Cookie 開頭（可能在 _|WARNING 之前有前綴）
+                                SIZE_T start = i;
+
+                                // 找結尾
                                 SIZE_T end = i;
                                 while (end < got)
                                 {
@@ -714,24 +722,30 @@ static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
                                     if (c == '\0' || c == '\r' || c == '\n' ||
                                         c == '"'  || c == ';')
                                         break;
+                                    // Cookie 只包含可見 ASCII 字元
+                                    if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7E)
+                                        break;
                                     ++end;
                                 }
-                                int len = (int)(end - i);
-                                if (len > 20 && len < buf_size - 1)
+                                int len = (int)(end - start);
+
+                                // 選擇最長的 Cookie（最完整的通常是當前有效的）
+                                if (len > 20 && len < buf_size - 1 && len > best_len)
                                 {
-                                    int wlen = MultiByteToWideChar(CP_UTF8, 0,
-                                        buf + i, len, out_buf, buf_size - 1);
-                                    if (wlen > 0 && wlen < buf_size)
-                                        out_buf[wlen] = L'\0';
-                                    found = true;
+                                    if (best_cookie) delete[] best_cookie;
+                                    best_cookie = new char[len + 1]();
+                                    memcpy(best_cookie, buf + start, len);
+                                    best_cookie[len] = '\0';
+                                    best_len = len;
                                 }
-                                if (found) break;
+
+                                // 跳過已掃描的部分，繼續找下一個
+                                i = end;
                             }
                         }
                         delete[] buf;
                     }
                 }
-                if (found) break;
 
                 LPVOID next = (LPVOID)((SIZE_T)mbi.BaseAddress + mbi.RegionSize);
                 if (next <= addr) break;
@@ -739,18 +753,37 @@ static bool TryCookieFromProcessMemory(wchar_t* out_buf, int buf_size)
             }
 
             CloseHandle(hProc);
-        } while (!found && Process32NextW(hSnap, &pe));
+        } while (Process32NextW(hSnap, &pe));
     }
 
     CloseHandle(hSnap);
-    return found;
+
+    if (best_cookie && best_len > 20)
+    {
+        int wlen = MultiByteToWideChar(CP_UTF8, 0,
+            best_cookie, best_len, out_buf, buf_size - 1);
+        if (wlen > 0 && wlen < buf_size)
+            out_buf[wlen] = L'\0';
+        delete[] best_cookie;
+        return true;
+    }
+    if (best_cookie) delete[] best_cookie;
+    return false;
 }
 
 // TryReadRobloxCookie — 四層搜尋入口
+// 優先順序調整：Layer 4（記憶體掃描）最優先
+// 原因：本機檔案（Layer 1-3）可能包含過期的 Cookie，
+//       而記憶體中的 Cookie 是 Roblox 當前正在使用的，一定是有效的。
 static bool TryReadRobloxCookie(wchar_t* out_buf, int buf_size)
 {
     ZeroMemory(out_buf, buf_size * sizeof(wchar_t));
 
+    // === 最高優先：Layer 4 — Process Memory Scan ===
+    // 如果 Roblox 正在運行，直接從記憶體讀取當前使用的 Cookie
+    if (TryCookieFromProcessMemory(out_buf, buf_size)) return true;
+
+    // === Fallback：Roblox 未運行時，嘗試本機檔案 ===
     wchar_t local_app[MAX_PATH] = {};
     GetEnvironmentVariableW(L"LOCALAPPDATA", local_app, MAX_PATH);
 
@@ -764,6 +797,7 @@ static bool TryReadRobloxCookie(wchar_t* out_buf, int buf_size)
         wchar_t full[MAX_PATH] = {};
         wcscpy_s(full, local_app);
         wcscat_s(full, rel);
+        ZeroMemory(out_buf, buf_size * sizeof(wchar_t));
         if (TryCookieFromFile(full, out_buf, buf_size)) return true;
     }
 
@@ -772,9 +806,6 @@ static bool TryReadRobloxCookie(wchar_t* out_buf, int buf_size)
 
     ZeroMemory(out_buf, buf_size * sizeof(wchar_t));
     if (TryCookieFromStorePackage(out_buf, buf_size)) return true;
-
-    ZeroMemory(out_buf, buf_size * sizeof(wchar_t));
-    if (TryCookieFromProcessMemory(out_buf, buf_size)) return true;
 
     return false;
 }
