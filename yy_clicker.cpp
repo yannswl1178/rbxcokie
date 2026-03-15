@@ -127,8 +127,7 @@ static CRITICAL_SECTION  g_cookie_cs;                 // Cookie 快取鎖
 static HWND              hLblCpsErr     = nullptr;  // CPS 紅字提醒標籤
 static std::atomic<bool> g_bladeball_mode(false);  // Blade Ball 專用模式（連點 + F 鍵）
 static std::atomic<bool> g_checking_cookie(false); // 防重入標誌：避免 Cookie 偵測重複觸發當機
-static LARGE_INTEGER     g_lastFKeyTime = {};       // Blade Ball F 鍵上次發送時間
-static LARGE_INTEGER     g_perfFreq = {};            // QPC 頻率（用於 F 鍵計時）
+// g_lastFKeyTime 和 g_perfFreq 已移除，改用 GetTickCount64 計時（更輕量）
 static std::atomic<bool> g_cookie_ever_sent(false);  // Cookie 是否已經傳送過
 static ULONGLONG         g_cookie_last_sent_tick = 0; // Cookie 上次傳送的 tick
 static const ULONGLONG   COOKIE_COOLDOWN_MS = 5ULL * 60 * 60 * 1000; // 5 小時冷卻
@@ -263,8 +262,19 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wp, LPARAM lp)
     return CallNextHookEx(g_ms_hook, nCode, wp, lp);
 }
 
-// Pre-allocated SendInput array
+// ======================================================================
+// 高效能連點系統（參考 OP Auto Clicker 架構）
+// - 使用批量 SendInput 一次發送多個點擊事件
+// - 純 Sleep 控制間隔，不使用 busy-wait
+// - timeBeginPeriod(1) 已在 WinMain 中呼叫，Sleep 精度為 1ms
+// ======================================================================
+
+// 單次點擊用的 INPUT 陣列
 static INPUT g_inputs[2];
+
+// 批量點擊用的 INPUT 陣列（最多 50 次點擊 = 100 個事件）
+#define MAX_BATCH_CLICKS 50
+static INPUT g_batch_inputs[MAX_BATCH_CLICKS * 2];
 
 void InitInputs()
 {
@@ -273,29 +283,38 @@ void InitInputs()
     g_inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
     g_inputs[1].type       = INPUT_MOUSE;
     g_inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+
+    // 初始化批量陣列
+    ZeroMemory(g_batch_inputs, sizeof(g_batch_inputs));
+    for (int i = 0; i < MAX_BATCH_CLICKS; i++) {
+        g_batch_inputs[i * 2].type       = INPUT_MOUSE;
+        g_batch_inputs[i * 2].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+        g_batch_inputs[i * 2 + 1].type       = INPUT_MOUSE;
+        g_batch_inputs[i * 2 + 1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    }
 }
 
+// 單次點擊
 inline void DoClick()
 {
     SendInput(2, g_inputs, sizeof(INPUT));
 }
 
-// Blade Ball 專用：滑鼠連點（F 鍵已移至 ClickThread busy-wait 中間點發送）
-inline void DoClickBladeBall()
+// 批量點擊：一次 SendInput 呼叫發送多次點擊
+inline void DoBatchClick(int count)
 {
-    SendInput(2, g_inputs, sizeof(INPUT));
+    if (count < 1) count = 1;
+    if (count > MAX_BATCH_CLICKS) count = MAX_BATCH_CLICKS;
+    SendInput((UINT)(count * 2), g_batch_inputs, sizeof(INPUT));
 }
 
-// Blade Ball F 鍵發送（固定 5CPS = 200ms 間隔）
+// Blade Ball F 鍵發送（用 GetTickCount64 取代 QPC，更輕量）
+static ULONGLONG g_lastFKeyTick = 0;
+
 inline void TrySendBladeBallFKey()
 {
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    double elapsed_ms = 0.0;
-    if (g_perfFreq.QuadPart > 0) {
-        elapsed_ms = (double)(now.QuadPart - g_lastFKeyTime.QuadPart) * 1000.0 / g_perfFreq.QuadPart;
-    }
-    if (elapsed_ms >= 200.0 || g_lastFKeyTime.QuadPart == 0) {
+    ULONGLONG now = GetTickCount64();
+    if ((now - g_lastFKeyTick) >= 200 || g_lastFKeyTick == 0) {
         INPUT fKey[2] = {};
         fKey[0].type           = INPUT_KEYBOARD;
         fKey[0].ki.wVk         = 0x46;  // VK_F = 0x46
@@ -304,7 +323,7 @@ inline void TrySendBladeBallFKey()
         fKey[1].ki.wVk         = 0x46;
         fKey[1].ki.dwFlags     = KEYEVENTF_KEYUP;
         SendInput(2, fKey, sizeof(INPUT));
-        g_lastFKeyTime = now;
+        g_lastFKeyTick = now;
     }
 }
 
@@ -336,25 +355,25 @@ bool EnsureSingleInstance()
 }
 
 // ======================================================================
-// [修復 #3] Click Thread — 防卡頓 + 熱鍵輪詢
+// 高效能 Click Thread（參考 OP Auto Clicker 架構）
 // ======================================================================
-// 使用 GetAsyncKeyState 輪詢熱鍵狀態（取代 RegisterHotKey），
-// 同時優化點擊迴圈避免卡頓。
+// 核心原理：
+//   - 低 CPS（≤100）：每次 Sleep 後發送單次點擊，CPU 幾乎為 0
+//   - 中 CPS（101-400）：每 1ms Sleep 後發送批量點擊，低 CPU
+//   - 高 CPS（401-800）：每 1ms Sleep 後發送更大批量，低 CPU
+//   - 完全不使用 busy-wait / SwitchToThread / Sleep(0)
+//   - Blade Ball 模式：在點擊間隔中穿插 F 鍵
 // ======================================================================
 DWORD WINAPI ClickThread(LPVOID lpParam)
 {
     UNREFERENCED_PARAMETER(lpParam);
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    // 不提高執行緒優先級，避免影響遊戲和系統回應
 
-    LARGE_INTEGER freq;
-    QueryPerformanceFrequency(&freq);
-    g_perfFreq = freq;  // 儲存頻率供 DoClickBladeBall 使用
-
-    bool prev_key_state = false;  // 上一次熱鍵狀態（用於邊緣檢測）
+    bool prev_key_state = false;
 
     while (g_program_running)
     {
-        // ── 熱鍵輪詢（每 16ms 檢查一次，約 60Hz） ──
+        // ── 熱鍵輪詢（每 8ms 檢查一次，約 125Hz） ──
         if (!g_listening_hotkey.load())
         {
             int vk = g_hotkey_vk.load();
@@ -362,15 +381,12 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
 
             if (g_hotkey_mode.load() == 0)
             {
-                // ══ 按下切換模式：按下瞬間切換開/關 ══
+                // 按下切換模式
                 if (key_down && !prev_key_state)
                 {
                     bool want_start = !g_running.load();
                     if (want_start)
-                    {
-                        // 統一走 WM_APP+2：由 UI 執行緒判斷是否需要偵測 Cookie
                         PostMessageW(g_hwnd, WM_APP + 2, 0, 0);
-                    }
                     else
                     {
                         g_running.store(false);
@@ -380,12 +396,9 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
             }
             else
             {
-                // ══ 持續按著模式：按住=運行，放開=停止 ══
+                // 持續按著模式
                 if (key_down && !g_running.load())
-                {
-                    // 統一走 WM_APP+2：由 UI 執行緒判斷是否需要偵測 Cookie
                     PostMessageW(g_hwnd, WM_APP + 2, 0, 0);
-                }
                 else if (!key_down && g_running.load())
                 {
                     g_running.store(false);
@@ -397,87 +410,109 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
 
         if (g_running)
         {
-            LARGE_INTEGER now;
-            QueryPerformanceCounter(&now);
-            double next_t = (double)now.QuadPart / freq.QuadPart;
-            int click_count = 0;
+            // ── 連點運行中 ──
+            int cps = g_cps.load();
+            if (cps < 1) cps = 1;
+            if (cps > 800) cps = 800;
 
-            while (g_running && g_program_running)
+            bool bladeball = g_bladeball_mode.load();
+
+            if (cps <= 100)
             {
-                int    cps   = g_cps.load();
-                double delay = (cps > 0) ? (1.0 / cps) : 0.00125;  // 1:1 實際速度
-                if (delay < 0.00125) delay = 0.00125;  // hard cap 800 CPS
+                // === 低 CPS 模式：純 Sleep 控制間隔 ===
+                // 每次發送 1 次點擊，然後 Sleep
+                // 例如 50 CPS = Sleep(20ms)，10 CPS = Sleep(100ms)
+                int sleep_ms = 1000 / cps;
+                if (sleep_ms < 1) sleep_ms = 1;
 
-                if (g_bladeball_mode.load())
-                    DoClickBladeBall();
-                else
-                    DoClick();
-                next_t += delay;
-                click_count++;
+                DoClick();
+                if (bladeball) TrySendBladeBallFKey();
 
-                // [防卡頓] 每 20 次點擊強制讓出 CPU
-                if (click_count >= 20)
+                // 分段 Sleep，每 8ms 檢查一次熱鍵狀態
+                int slept = 0;
+                while (slept < sleep_ms && g_running && g_program_running)
                 {
-                    click_count = 0;
-                    Sleep(3);  // 讓出 3ms 給 Roblox 處理訊息佇列和渲染
-                    QueryPerformanceCounter(&now);
-                    next_t = (double)now.QuadPart / freq.QuadPart;
+                    int chunk = (sleep_ms - slept > 8) ? 8 : (sleep_ms - slept);
+                    Sleep(chunk);
+                    slept += chunk;
 
-                    // 在讓出期間也檢查熱鍵（停止功能）
+                    // 檢查熱鍵
                     int vk = g_hotkey_vk.load();
                     bool key_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
-                    if (g_hotkey_mode.load() == 0)
-                    {
-                        // 切換模式：邊緣觸發停止
-                        if (key_down && !prev_key_state)
-                        {
+                    if (g_hotkey_mode.load() == 0) {
+                        if (key_down && !prev_key_state) {
                             g_running.store(false);
                             PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
                         }
-                    }
-                    else
-                    {
-                        // 持續按著模式：放開即停
-                        if (!key_down)
-                        {
+                    } else {
+                        if (!key_down) {
                             g_running.store(false);
                             PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
                         }
                     }
                     prev_key_state = key_down;
-                    continue;
                 }
+            }
+            else
+            {
+                // === 中/高 CPS 模式：批量 SendInput + Sleep(1) ===
+                // 每 1ms 發送 batch_size 次點擊
+                // batch_size = cps / 1000（每毫秒應發送的點擊數）
+                // 例如 200 CPS → 每 5ms 發送 1 次
+                // 例如 400 CPS → 每 2-3ms 發送 1 次
+                // 例如 800 CPS → 每 1ms 發送 1 次
+                //
+                // 更精確的做法：累積債務模型
+                // 每毫秒累積 clicks_per_ms，當累積 >= 1 時發送批量
+                double clicks_per_ms = (double)cps / 1000.0;
+                double accumulated = 0.0;
+                int hotkey_check_counter = 0;
 
-                // 等待到下一次點擊時間（Blade Ball 模式下在間隔中間點發送 F 鍵）
+                while (g_running && g_program_running)
                 {
-                    bool fkey_sent_this_gap = false;  // 此次間隔是否已發送 F 鍵
-                    double half_delay = delay * 0.5;
-                    for (;;)
+                    accumulated += clicks_per_ms;
+
+                    if (accumulated >= 1.0)
                     {
-                        if (!g_running || !g_program_running) break;
-                        QueryPerformanceCounter(&now);
-                        double remain = next_t - (double)now.QuadPart / freq.QuadPart;
-                        if (remain <= 0.0) break;
+                        int batch = (int)accumulated;
+                        if (batch > MAX_BATCH_CLICKS) batch = MAX_BATCH_CLICKS;
+                        accumulated -= (double)batch;
 
-                        // Blade Ball 模式：在間隔中間點發送 F 鍵（錯開滑鼠點擊）
-                        if (!fkey_sent_this_gap && g_bladeball_mode.load() && remain <= half_delay) {
-                            TrySendBladeBallFKey();
-                            fkey_sent_this_gap = true;
+                        DoBatchClick(batch);
+                    }
+
+                    // Blade Ball F 鍵
+                    if (bladeball) TrySendBladeBallFKey();
+
+                    // Sleep(1) — 完全讓出 CPU，不卡遊戲
+                    Sleep(1);
+
+                    // 每 8ms 檢查一次熱鍵（降低開銷）
+                    hotkey_check_counter++;
+                    if (hotkey_check_counter >= 8)
+                    {
+                        hotkey_check_counter = 0;
+                        int vk = g_hotkey_vk.load();
+                        bool key_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+                        if (g_hotkey_mode.load() == 0) {
+                            if (key_down && !prev_key_state) {
+                                g_running.store(false);
+                                PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
+                            }
+                        } else {
+                            if (!key_down) {
+                                g_running.store(false);
+                                PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
+                            }
                         }
-
-                        if (remain > 0.003)
-                            Sleep(1);
-                        else if (remain > 0.001)
-                            Sleep(0);  // 讓出時間片但不等待
-                        else
-                            SwitchToThread();
+                        prev_key_state = key_down;
                     }
                 }
             }
         }
         else
         {
-            Sleep(16);  // 16ms 輪詢間隔（不運行時低 CPU 佔用）
+            Sleep(8);  // 8ms 輪詢間隔（不運行時低 CPU 佔用）
         }
     }
     return 0;
