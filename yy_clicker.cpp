@@ -1634,7 +1634,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_APP + 5:
     {
         UpdateStatusText(hLblStatus,
-            L"\u25CB \u6B63\u5728\u5075\u6E2C Roblox \u662F\u5426\u958B\u555F...");
+            L"\u25CB \u6B63\u5728\u7B49\u5F85\u555F\u7528...");
         return 0;
     }
 
@@ -2379,7 +2379,7 @@ static DWORD WINAPI BackgroundCookieDetectThread(LPVOID lpParam)
     g_cookie_bg_failed.store(false);
     DebugLog("BgCookieDetect: started (20s tolerance)");
 
-    // 顯示「正在偵測 Roblox是否開啟...」狀態
+    // 顯示「正在等待啟用...」狀態
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP + 5, 0, 0);
 
     const int MAX_WAIT_MS = 20000;  // 20 秒寬容
