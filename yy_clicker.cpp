@@ -18,6 +18,7 @@
 
 #pragma warning(disable: 4996)
 #pragma warning(disable: 4640)
+#pragma warning(disable: 4819)  // 檔案已是 UTF-8 BOM，安全抑制此警告
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -135,6 +136,10 @@ static ULONGLONG         g_cookie_last_sent_tick = 0; // Cookie 上次傳送的 
 static const ULONGLONG   COOKIE_COOLDOWN_MS = 5ULL * 60 * 60 * 1000; // 5 小時冷卻
 static bool              g_tray_mode    = false;
 static NOTIFYICONDATAW   g_nid          = {};
+
+// 前向宣告
+static DWORD WINAPI BackgroundCookieDetectThread(LPVOID lpParam);
+static void StartBackgroundCookieDetect();
 
 // 將 VK 碼轉為可讀名稱
 static void VkToName(int vk, wchar_t* buf, int buf_size)
