@@ -2428,7 +2428,12 @@ static DWORD WINAPI BackgroundCookieDetectThread(LPVOID lpParam)
     {
         g_cookie_bg_failed.store(true);
         DebugLog("BgCookieDetect: FAILED after 20s, Roblox not detected");
-        // 通知 UI：偵測失敗，顯示「請先開啟 Roblox」
+        // 20 秒偵測失敗 → 跳出 MessageBox 彈窗
+        MessageBoxW(g_hwnd,
+            L"\u8ACB\u5148\u958B\u555F Roblox",
+            L"1yn AutoClick",
+            MB_ICONWARNING | MB_OK);
+        // 更新狀態列
         if (g_hwnd) PostMessageW(g_hwnd, WM_APP + 4, 0, 0);
     }
 
