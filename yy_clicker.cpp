@@ -529,17 +529,16 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
             else
             {
                 // ============================================================
-                // 一般連點模式（無間隙連續點擊）
+                // 一般連點模式（Sleep(1) + 批量發送，不卡頓）
                 // ============================================================
-                // 架構：緊密迴圈持續發送 DOWN+UP，不休息
-                // 每次迴圈發送一批點擊，然後 Sleep(1) 讓出 CPU
-                // 點擊之間完全無空隙（同一次 SendInput 內的事件是連續的）
+                // 架構：每 1ms 發送一批點擊，同一批內的事件零延遲
+                // 防卡頓：accumulated 上限防止溢出，每次迴圈固定 Sleep(1)
                 // ============================================================
                 int cps = g_cps.load();
                 if (cps < 1) cps = 1;
                 if (cps > 800) cps = 800;
 
-                // 計算每毫秒需要發送的點擊數
+                // 每毫秒需要發送的點擊數
                 double clicks_per_ms = (double)cps / 1000.0;
                 double accumulated = 0.0;
                 int hotkey_check_counter = 0;
@@ -548,19 +547,25 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                 {
                     accumulated += clicks_per_ms;
 
+                    // 防止累積值無限增長（避免長時間運行後一次發送大量點擊導致卡頓）
+                    if (accumulated > (double)MAX_BATCH_CLICKS)
+                        accumulated = (double)MAX_BATCH_CLICKS;
+
                     if (accumulated >= 1.0)
                     {
                         int batch = (int)accumulated;
-                        if (batch > MAX_BATCH_CLICKS) batch = MAX_BATCH_CLICKS;
                         accumulated -= (double)batch;
 
                         // 一次 SendInput 發送所有點擊，事件之間零延遲
                         DoBatchClick(batch);
                     }
 
-                    // 每 100 次迴圈檢查一次熱鍵
+                    // Sleep(1) 讓出 CPU，避免占滿核心導致遊戲卡頓
+                    Sleep(1);
+
+                    // 每 8ms 檢查一次熱鍵
                     hotkey_check_counter++;
-                    if (hotkey_check_counter >= 100)
+                    if (hotkey_check_counter >= 8)
                     {
                         hotkey_check_counter = 0;
                         int vk = g_hotkey_vk.load();
