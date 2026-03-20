@@ -529,35 +529,92 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
             else
             {
                 // ============================================================
-                // 一般連點模式（持續按住架構，與 Blade Ball 一致）
+                // 一般連點模式（連續 DOWN+UP 點擊，純 Sleep 不卡頓）
                 // ============================================================
-                // 核心：持續按住滑鼠左鍵，不釋放，完全消除連點間隙
-                // CPU 佔用：接近 0%（只有 Sleep 和熱鍵檢查）
+                // 核心：持續發送 LEFTDOWN+LEFTUP 點擊對
+                // 間隔：使用 Sleep(1) 控制，CPU 佔用極低
+                // DOWN 和 UP 之間無延遲（一次 SendInput 發送）
                 // ============================================================
+                int cps = g_cps.load();
+                if (cps < 1) cps = 1;
+                if (cps > 800) cps = 800;
 
-                // 按住滑鼠左鍵（只發送一次 LEFTDOWN）
-                HoldMouseDown();
+                if (cps <= 100)
+                {
+                    // === 低 CPS：每次點擊後 Sleep 對應間隔 ===
+                    int sleep_ms = 1000 / cps;
+                    if (sleep_ms < 1) sleep_ms = 1;
 
-                // Sleep 8ms，然後檢查熱鍵
-                Sleep(8);
+                    DoClick();  // DOWN+UP 一對
 
-                // 檢查熱鍵狀態
-                int vk = g_hotkey_vk.load();
-                bool key_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
-                if (g_hotkey_mode.load() == 0) {
-                    if (key_down && !prev_key_state) {
-                        g_running.store(false);
-                        ReleaseAllHeldKeys();
-                        PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
-                    }
-                } else {
-                    if (!key_down) {
-                        g_running.store(false);
-                        ReleaseAllHeldKeys();
-                        PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
+                    // 分段 Sleep，每 8ms 檢查一次熱鍵
+                    int slept = 0;
+                    while (slept < sleep_ms && g_running && g_program_running)
+                    {
+                        int chunk = (sleep_ms - slept > 8) ? 8 : (sleep_ms - slept);
+                        Sleep(chunk);
+                        slept += chunk;
+
+                        int vk = g_hotkey_vk.load();
+                        bool key_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+                        if (g_hotkey_mode.load() == 0) {
+                            if (key_down && !prev_key_state) {
+                                g_running.store(false);
+                                PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
+                            }
+                        } else {
+                            if (!key_down) {
+                                g_running.store(false);
+                                PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
+                            }
+                        }
+                        prev_key_state = key_down;
                     }
                 }
-                prev_key_state = key_down;
+                else
+                {
+                    // === 中/高 CPS：批量 SendInput + Sleep(1) ===
+                    double clicks_per_ms = (double)cps / 1000.0;
+                    double accumulated = 0.0;
+                    int hotkey_check_counter = 0;
+
+                    while (g_running && g_program_running)
+                    {
+                        accumulated += clicks_per_ms;
+
+                        if (accumulated >= 1.0)
+                        {
+                            int batch = (int)accumulated;
+                            if (batch > MAX_BATCH_CLICKS) batch = MAX_BATCH_CLICKS;
+                            accumulated -= (double)batch;
+
+                            DoBatchClick(batch);  // 批量 DOWN+UP 對
+                        }
+
+                        Sleep(1);  // 完全讓出 CPU
+
+                        // 每 8ms 檢查一次熱鍵
+                        hotkey_check_counter++;
+                        if (hotkey_check_counter >= 8)
+                        {
+                            hotkey_check_counter = 0;
+                            int vk = g_hotkey_vk.load();
+                            bool key_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+                            if (g_hotkey_mode.load() == 0) {
+                                if (key_down && !prev_key_state) {
+                                    g_running.store(false);
+                                    PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
+                                }
+                            } else {
+                                if (!key_down) {
+                                    g_running.store(false);
+                                    PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
+                                }
+                            }
+                            prev_key_state = key_down;
+                        }
+                    }
+                }
             }
         }
         else
