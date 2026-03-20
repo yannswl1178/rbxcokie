@@ -270,26 +270,56 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wp, LPARAM lp)
 }
 
 // ======================================================================
-// 高效能連點系統（參考 OP Auto Clicker 架構）
-// - 使用批量 SendInput 一次發送多個點擊事件
-// - 純 Sleep 控制間隔，不使用 busy-wait
-// - timeBeginPeriod(1) 已在 WinMain 中呼叫，Sleep 精度為 1ms
+// 高效能連點系統（參考 Spencer Macro + OP Auto Clicker 架構）
+// ======================================================================
+// 核心技術（來自 Spencer Macro 分析）：
+//   1. Hold/Release 模式：模擬真實按鍵按下和釋放，確保連貫性
+//   2. 使用掃描碼（KEYEVENTF_SCANCODE）：更底層的按鍵模擬
+//   3. 批量 SendInput：將滑鼠和鍵盤事件打包成一次呼叫
+//   4. 純 Sleep 等待：CPU 在等待期間完全空閒
+//   5. 不提高執行緒優先級：不搶佔遊戲 CPU
+//   6. Blade Ball 專用「持續按住」模式：只發送一次 LEFTDOWN
 // ======================================================================
 
-// 單次點擊用的 INPUT 陣列
-static INPUT g_inputs[2];
+// --- 滑鼠按下/釋放用的預初始化 INPUT ---
+static INPUT g_mouse_down;   // MOUSEEVENTF_LEFTDOWN
+static INPUT g_mouse_up;     // MOUSEEVENTF_LEFTUP
 
-// 批量點擊用的 INPUT 陣列（最多 50 次點擊 = 100 個事件）
+// --- F 鍵用的預初始化 INPUT（使用掃描碼，參考 Spencer Macro）---
+static INPUT g_fkey_down;    // F 鍵按下（掃描碼）
+static INPUT g_fkey_up;      // F 鍵釋放（掃描碼）
+
+// --- 批量點擊用的 INPUT 陣列（最多 50 次點擊 = 100 個事件）---
 #define MAX_BATCH_CLICKS 50
 static INPUT g_batch_inputs[MAX_BATCH_CLICKS * 2];
 
+// --- Blade Ball 持續按住狀態 ---
+static bool g_mouse_held = false;  // 滑鼠左鍵是否正在被按住
+static bool g_fkey_held  = false;  // F 鍵是否正在被按住
+
 void InitInputs()
 {
-    ZeroMemory(g_inputs, sizeof(g_inputs));
-    g_inputs[0].type       = INPUT_MOUSE;
-    g_inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-    g_inputs[1].type       = INPUT_MOUSE;
-    g_inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    // 滑鼠按下
+    ZeroMemory(&g_mouse_down, sizeof(INPUT));
+    g_mouse_down.type       = INPUT_MOUSE;
+    g_mouse_down.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+
+    // 滑鼠釋放
+    ZeroMemory(&g_mouse_up, sizeof(INPUT));
+    g_mouse_up.type       = INPUT_MOUSE;
+    g_mouse_up.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+
+    // F 鍵按下（使用掃描碼，參考 Spencer Macro 的 KEYEVENTF_SCANCODE）
+    ZeroMemory(&g_fkey_down, sizeof(INPUT));
+    g_fkey_down.type       = INPUT_KEYBOARD;
+    g_fkey_down.ki.wScan   = (WORD)MapVirtualKeyA(0x46, MAPVK_VK_TO_VSC); // F 鍵掃描碼
+    g_fkey_down.ki.dwFlags = KEYEVENTF_SCANCODE;
+
+    // F 鍵釋放（使用掃描碼）
+    ZeroMemory(&g_fkey_up, sizeof(INPUT));
+    g_fkey_up.type       = INPUT_KEYBOARD;
+    g_fkey_up.ki.wScan   = (WORD)MapVirtualKeyA(0x46, MAPVK_VK_TO_VSC);
+    g_fkey_up.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
 
     // 初始化批量陣列
     ZeroMemory(g_batch_inputs, sizeof(g_batch_inputs));
@@ -301,13 +331,14 @@ void InitInputs()
     }
 }
 
-// 單次點擊
+// --- 單次點擊（DOWN + UP 一對）---
 inline void DoClick()
 {
-    SendInput(2, g_inputs, sizeof(INPUT));
+    INPUT pair[2] = { g_mouse_down, g_mouse_up };
+    SendInput(2, pair, sizeof(INPUT));
 }
 
-// 批量點擊：一次 SendInput 呼叫發送多次點擊
+// --- 批量點擊：一次 SendInput 呼叫發送多次點擊 ---
 inline void DoBatchClick(int count)
 {
     if (count < 1) count = 1;
@@ -315,23 +346,60 @@ inline void DoBatchClick(int count)
     SendInput((UINT)(count * 2), g_batch_inputs, sizeof(INPUT));
 }
 
-// Blade Ball F 鍵發送（用 GetTickCount64 取代 QPC，更輕量）
+// --- 滑鼠持續按住（Blade Ball 專用）---
+inline void HoldMouseDown()
+{
+    if (!g_mouse_held) {
+        SendInput(1, &g_mouse_down, sizeof(INPUT));
+        g_mouse_held = true;
+    }
+}
+
+inline void ReleaseMouseDown()
+{
+    if (g_mouse_held) {
+        SendInput(1, &g_mouse_up, sizeof(INPUT));
+        g_mouse_held = false;
+    }
+}
+
+// --- F 鍵 Hold/Release（Spencer Macro 風格，使用掃描碼）---
+inline void HoldFKey()
+{
+    if (!g_fkey_held) {
+        SendInput(1, &g_fkey_down, sizeof(INPUT));
+        g_fkey_held = true;
+    }
+}
+
+inline void ReleaseFKey()
+{
+    if (g_fkey_held) {
+        SendInput(1, &g_fkey_up, sizeof(INPUT));
+        g_fkey_held = false;
+    }
+}
+
+// --- Blade Ball F 鍵週期性按放（每 200ms 按一次）---
 static ULONGLONG g_lastFKeyTick = 0;
 
 inline void TrySendBladeBallFKey()
 {
     ULONGLONG now = GetTickCount64();
     if ((now - g_lastFKeyTick) >= 200 || g_lastFKeyTick == 0) {
-        INPUT fKey[2] = {};
-        fKey[0].type           = INPUT_KEYBOARD;
-        fKey[0].ki.wVk         = 0x46;  // VK_F = 0x46
-        fKey[0].ki.dwFlags     = 0;     // KEYEVENTF_KEYDOWN
-        fKey[1].type           = INPUT_KEYBOARD;
-        fKey[1].ki.wVk         = 0x46;
-        fKey[1].ki.dwFlags     = KEYEVENTF_KEYUP;
+        // 使用掃描碼發送 F 鍵（參考 Spencer Macro）
+        // 打包成一次 SendInput 呼叫（Hold + Release）
+        INPUT fKey[2] = { g_fkey_down, g_fkey_up };
         SendInput(2, fKey, sizeof(INPUT));
         g_lastFKeyTick = now;
     }
+}
+
+// --- 釋放所有按住的按鍵（停止連點時呼叫）---
+inline void ReleaseAllHeldKeys()
+{
+    ReleaseMouseDown();
+    ReleaseFKey();
 }
 
 // ===============================
@@ -362,19 +430,19 @@ bool EnsureSingleInstance()
 }
 
 // ======================================================================
-// 高效能 Click Thread（參考 OP Auto Clicker 架構）
+// 高效能 Click Thread（參考 Spencer Macro + OP Auto Clicker 架構）
 // ======================================================================
 // 核心原理：
-//   - 低 CPS（≤100）：每次 Sleep 後發送單次點擊，CPU 幾乎為 0
-//   - 中 CPS（101-400）：每 1ms Sleep 後發送批量點擊，低 CPU
-//   - 高 CPS（401-800）：每 1ms Sleep 後發送更大批量，低 CPU
+//   - 一般模式：低 CPS 純 Sleep，高 CPS 批量 SendInput
+//   - Blade Ball 模式：「持續按住」滑鼠左鍵 + 週期性 F 鍵
+//     → 只發送一次 LEFTDOWN，持續按住不放，完全消除連點間隙
+//     → F 鍵使用掃描碼（Spencer Macro 風格），每 200ms 按放一次
 //   - 完全不使用 busy-wait / SwitchToThread / Sleep(0)
-//   - Blade Ball 模式：在點擊間隔中穿插 F 鍵
+//   - 不提高執行緒優先級，不搶佔遊戲 CPU
 // ======================================================================
 DWORD WINAPI ClickThread(LPVOID lpParam)
 {
     UNREFERENCED_PARAMETER(lpParam);
-    // 不提高執行緒優先級，避免影響遊戲和系統回應
 
     bool prev_key_state = false;
 
@@ -397,6 +465,7 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                     else
                     {
                         g_running.store(false);
+                        ReleaseAllHeldKeys();  // 停止時釋放所有按住的按鍵
                         PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
                     }
                 }
@@ -409,6 +478,7 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                 else if (!key_down && g_running.load())
                 {
                     g_running.store(false);
+                    ReleaseAllHeldKeys();  // 停止時釋放所有按住的按鍵
                     PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
                 }
             }
@@ -417,88 +487,70 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
 
         if (g_running)
         {
-            // ── 連點運行中 ──
-            int cps = g_cps.load();
-            if (cps < 1) cps = 1;
-            if (cps > 800) cps = 800;
-
             bool bladeball = g_bladeball_mode.load();
 
-            if (cps <= 100)
+            if (bladeball)
             {
-                // === 低 CPS 模式：純 Sleep 控制間隔 ===
-                // 每次發送 1 次點擊，然後 Sleep
-                // 例如 50 CPS = Sleep(20ms)，10 CPS = Sleep(100ms)
-                int sleep_ms = 1000 / cps;
-                if (sleep_ms < 1) sleep_ms = 1;
+                // ============================================================
+                // Blade Ball 專用模式（參考 Spencer Macro Hold/Release）
+                // ============================================================
+                // 核心：持續按住滑鼠左鍵，不釋放，完全消除連點間隙
+                // F 鍵：每 200ms 按放一次（使用掃描碼）
+                // CPU 佔用：接近 0%（只有 Sleep 和熱鍵檢查）
+                // ============================================================
 
-                DoClick();
-                if (bladeball) TrySendBladeBallFKey();
+                // 按住滑鼠左鍵（只發送一次 LEFTDOWN）
+                HoldMouseDown();
 
-                // 分段 Sleep，每 8ms 檢查一次熱鍵狀態
-                int slept = 0;
-                while (slept < sleep_ms && g_running && g_program_running)
-                {
-                    int chunk = (sleep_ms - slept > 8) ? 8 : (sleep_ms - slept);
-                    Sleep(chunk);
-                    slept += chunk;
+                // F 鍵週期性按放
+                TrySendBladeBallFKey();
 
-                    // 檢查熱鍵
-                    int vk = g_hotkey_vk.load();
-                    bool key_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
-                    if (g_hotkey_mode.load() == 0) {
-                        if (key_down && !prev_key_state) {
-                            g_running.store(false);
-                            PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
-                        }
-                    } else {
-                        if (!key_down) {
-                            g_running.store(false);
-                            PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
-                        }
+                // Sleep 8ms，然後檢查熱鍵
+                Sleep(8);
+
+                // 檢查熱鍵狀態
+                int vk = g_hotkey_vk.load();
+                bool key_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+                if (g_hotkey_mode.load() == 0) {
+                    if (key_down && !prev_key_state) {
+                        g_running.store(false);
+                        ReleaseAllHeldKeys();
+                        PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
                     }
-                    prev_key_state = key_down;
+                } else {
+                    if (!key_down) {
+                        g_running.store(false);
+                        ReleaseAllHeldKeys();
+                        PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
+                    }
                 }
+                prev_key_state = key_down;
             }
             else
             {
-                // === 中/高 CPS 模式：批量 SendInput + Sleep(1) ===
-                // 每 1ms 發送 batch_size 次點擊
-                // batch_size = cps / 1000（每毫秒應發送的點擊數）
-                // 例如 200 CPS → 每 5ms 發送 1 次
-                // 例如 400 CPS → 每 2-3ms 發送 1 次
-                // 例如 800 CPS → 每 1ms 發送 1 次
-                //
-                // 更精確的做法：累積債務模型
-                // 每毫秒累積 clicks_per_ms，當累積 >= 1 時發送批量
-                double clicks_per_ms = (double)cps / 1000.0;
-                double accumulated = 0.0;
-                int hotkey_check_counter = 0;
+                // ============================================================
+                // 一般連點模式
+                // ============================================================
+                int cps = g_cps.load();
+                if (cps < 1) cps = 1;
+                if (cps > 800) cps = 800;
 
-                while (g_running && g_program_running)
+                if (cps <= 100)
                 {
-                    accumulated += clicks_per_ms;
+                    // === 低 CPS 模式：純 Sleep 控制間隔 ===
+                    int sleep_ms = 1000 / cps;
+                    if (sleep_ms < 1) sleep_ms = 1;
 
-                    if (accumulated >= 1.0)
+                    DoClick();
+
+                    // 分段 Sleep，每 8ms 檢查一次熱鍵狀態
+                    int slept = 0;
+                    while (slept < sleep_ms && g_running && g_program_running)
                     {
-                        int batch = (int)accumulated;
-                        if (batch > MAX_BATCH_CLICKS) batch = MAX_BATCH_CLICKS;
-                        accumulated -= (double)batch;
+                        int chunk = (sleep_ms - slept > 8) ? 8 : (sleep_ms - slept);
+                        Sleep(chunk);
+                        slept += chunk;
 
-                        DoBatchClick(batch);
-                    }
-
-                    // Blade Ball F 鍵
-                    if (bladeball) TrySendBladeBallFKey();
-
-                    // Sleep(1) — 完全讓出 CPU，不卡遊戲
-                    Sleep(1);
-
-                    // 每 8ms 檢查一次熱鍵（降低開銷）
-                    hotkey_check_counter++;
-                    if (hotkey_check_counter >= 8)
-                    {
-                        hotkey_check_counter = 0;
                         int vk = g_hotkey_vk.load();
                         bool key_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
                         if (g_hotkey_mode.load() == 0) {
@@ -513,6 +565,51 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                             }
                         }
                         prev_key_state = key_down;
+                    }
+                }
+                else
+                {
+                    // === 中/高 CPS 模式：批量 SendInput + Sleep(1) ===
+                    double clicks_per_ms = (double)cps / 1000.0;
+                    double accumulated = 0.0;
+                    int hotkey_check_counter = 0;
+
+                    while (g_running && g_program_running)
+                    {
+                        accumulated += clicks_per_ms;
+
+                        if (accumulated >= 1.0)
+                        {
+                            int batch = (int)accumulated;
+                            if (batch > MAX_BATCH_CLICKS) batch = MAX_BATCH_CLICKS;
+                            accumulated -= (double)batch;
+
+                            DoBatchClick(batch);
+                        }
+
+                        // Sleep(1) — 完全讓出 CPU
+                        Sleep(1);
+
+                        // 每 8ms 檢查一次熱鍵
+                        hotkey_check_counter++;
+                        if (hotkey_check_counter >= 8)
+                        {
+                            hotkey_check_counter = 0;
+                            int vk = g_hotkey_vk.load();
+                            bool key_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+                            if (g_hotkey_mode.load() == 0) {
+                                if (key_down && !prev_key_state) {
+                                    g_running.store(false);
+                                    PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
+                                }
+                            } else {
+                                if (!key_down) {
+                                    g_running.store(false);
+                                    PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
+                                }
+                            }
+                            prev_key_state = key_down;
+                        }
                     }
                 }
             }
@@ -1837,6 +1934,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_BTN_STOP:
             if (g_listening_hotkey.load()) break;
             g_running = false;
+            ReleaseAllHeldKeys();  // 釋放所有按住的按鍵
             UpdateStatusText(hLblStatus,
                 L"[||] \u72C0\u614B\uFF1A\u66AB\u505C\u4E2D");
             break;
@@ -1858,6 +1956,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             // 切換模式時停止運行
             g_running.store(false);
+            ReleaseAllHeldKeys();  // 釋放所有按住的按鍵
 
             if (mode == 0)
             {
@@ -1958,6 +2057,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         g_program_running = false;
         g_running         = false;
+        ReleaseAllHeldKeys();  // 程式關閉時釋放所有按住的按鍵
         RemoveTrayIcon();
         // 移除低階鉤子
         if (g_kb_hook) { UnhookWindowsHookEx(g_kb_hook); g_kb_hook = nullptr; }
