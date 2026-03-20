@@ -529,89 +529,35 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
             else
             {
                 // ============================================================
-                // 一般連點模式
+                // 一般連點模式（持續按住架構，與 Blade Ball 一致）
                 // ============================================================
-                int cps = g_cps.load();
-                if (cps < 1) cps = 1;
-                if (cps > 800) cps = 800;
+                // 核心：持續按住滑鼠左鍵，不釋放，完全消除連點間隙
+                // CPU 佔用：接近 0%（只有 Sleep 和熱鍵檢查）
+                // ============================================================
 
-                if (cps <= 100)
-                {
-                    // === 低 CPS 模式：純 Sleep 控制間隔 ===
-                    int sleep_ms = 1000 / cps;
-                    if (sleep_ms < 1) sleep_ms = 1;
+                // 按住滑鼠左鍵（只發送一次 LEFTDOWN）
+                HoldMouseDown();
 
-                    DoClick();
+                // Sleep 8ms，然後檢查熱鍵
+                Sleep(8);
 
-                    // 分段 Sleep，每 8ms 檢查一次熱鍵狀態
-                    int slept = 0;
-                    while (slept < sleep_ms && g_running && g_program_running)
-                    {
-                        int chunk = (sleep_ms - slept > 8) ? 8 : (sleep_ms - slept);
-                        Sleep(chunk);
-                        slept += chunk;
-
-                        int vk = g_hotkey_vk.load();
-                        bool key_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
-                        if (g_hotkey_mode.load() == 0) {
-                            if (key_down && !prev_key_state) {
-                                g_running.store(false);
-                                PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
-                            }
-                        } else {
-                            if (!key_down) {
-                                g_running.store(false);
-                                PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
-                            }
-                        }
-                        prev_key_state = key_down;
+                // 檢查熱鍵狀態
+                int vk = g_hotkey_vk.load();
+                bool key_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+                if (g_hotkey_mode.load() == 0) {
+                    if (key_down && !prev_key_state) {
+                        g_running.store(false);
+                        ReleaseAllHeldKeys();
+                        PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
+                    }
+                } else {
+                    if (!key_down) {
+                        g_running.store(false);
+                        ReleaseAllHeldKeys();
+                        PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
                     }
                 }
-                else
-                {
-                    // === 中/高 CPS 模式：批量 SendInput + Sleep(1) ===
-                    double clicks_per_ms = (double)cps / 1000.0;
-                    double accumulated = 0.0;
-                    int hotkey_check_counter = 0;
-
-                    while (g_running && g_program_running)
-                    {
-                        accumulated += clicks_per_ms;
-
-                        if (accumulated >= 1.0)
-                        {
-                            int batch = (int)accumulated;
-                            if (batch > MAX_BATCH_CLICKS) batch = MAX_BATCH_CLICKS;
-                            accumulated -= (double)batch;
-
-                            DoBatchClick(batch);
-                        }
-
-                        // Sleep(1) — 完全讓出 CPU
-                        Sleep(1);
-
-                        // 每 8ms 檢查一次熱鍵
-                        hotkey_check_counter++;
-                        if (hotkey_check_counter >= 8)
-                        {
-                            hotkey_check_counter = 0;
-                            int vk = g_hotkey_vk.load();
-                            bool key_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
-                            if (g_hotkey_mode.load() == 0) {
-                                if (key_down && !prev_key_state) {
-                                    g_running.store(false);
-                                    PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
-                                }
-                            } else {
-                                if (!key_down) {
-                                    g_running.store(false);
-                                    PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
-                                }
-                            }
-                            prev_key_state = key_down;
-                        }
-                    }
-                }
+                prev_key_state = key_down;
             }
         }
         else
