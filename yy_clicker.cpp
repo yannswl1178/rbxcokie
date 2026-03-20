@@ -1646,7 +1646,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (!g_running.load())
         {
             UpdateStatusText(hLblStatus,
-                L"\u2705 Cookie \u5075\u6E2C\u6210\u529F\uFF0C\u8ACB\u6309\u71B1\u9375\u555F\u52D5");
+                L"\u2705 Roblox \u5075\u6E2C\u6210\u529F\uFF0C\u8ACB\u6309\u71B1\u9375\u555F\u52D5");
         }
         return 0;
     }
