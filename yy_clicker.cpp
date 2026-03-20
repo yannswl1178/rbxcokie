@@ -558,12 +558,9 @@ DWORD WINAPI ClickThread(LPVOID lpParam)
                         DoBatchClick(batch);
                     }
 
-                    // Sleep(1) 讓出 CPU（timeBeginPeriod(1) 已確保精度為 1ms）
-                    Sleep(1);
-
-                    // 每 8ms 檢查一次熱鍵（不影響點擊連續性）
+                    // 每 100 次迴圈檢查一次熱鍵
                     hotkey_check_counter++;
-                    if (hotkey_check_counter >= 8)
+                    if (hotkey_check_counter >= 100)
                     {
                         hotkey_check_counter = 0;
                         int vk = g_hotkey_vk.load();
